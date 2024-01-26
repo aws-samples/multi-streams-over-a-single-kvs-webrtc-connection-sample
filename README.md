@@ -3,7 +3,8 @@ Multi Streams Over A Single KVS WebRTC Connection Sample
 This is a static webpage that demonstrates how to support multi camera streams in a KVS WebRTC Viewer with a single p2p session.
 
 ## Getting Started
-This package works in conjunction with a specific remote side KVS WebRTC Master. To build and run the Master, please refer README.md file under csdk/.
+This package works in conjunction with a specific remote side KVS WebRTC Master. 
+To build and run the Master, please refer [README.md](https://github.com/aws-samples/multi-streams-over-a-single-kvs-webrtc-connection-sample/blob/main/csdk/README.md) file under `/csdk`.
 
 ### Viewer setup
 1. Clone or download the source code of this project.
