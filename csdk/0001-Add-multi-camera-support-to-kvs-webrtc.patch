@@ -1,0 +1,3921 @@
+From 28e0649d852e7c003c3c4bfde34d8453f88cb3f9 Mon Sep 17 00:00:00 2001
+From: zhichent <zhichent@ue5631fe038ef59.ant.amazon.com>
+Date: Tue, 23 Jan 2024 14:21:18 +0800
+Subject: [PATCH] Add multi camera support to kvs webrtc
+
+---
+ CMakeLists.txt                                |    4 +-
+ samples/Common.c                              |   28 +-
+ samples/Samples.h                             |   30 +-
+ samples/kvsRtspError.h                        |  134 ++
+ samples/kvsRtspSrc.c                          | 1131 +++++++++++++++++
+ samples/kvsRtspSrc.h                          |  185 +++
+ samples/kvsRtspSrcWrap.h                      |  130 ++
+ samples/kvsWebRTCClientMaster.c               |  244 +++-
+ .../kvsWebRTCClientMasterGstreamerSample.c    |  776 ++++++++---
+ samples/rtspconfig.txt                        |   16 +
+ .../kinesis/video/webrtcclient/Include.h      |    8 +-
+ src/source/Ice/IceAgent.h                     |    6 +-
+ src/source/Ice/TurnConnection.h               |    2 +-
+ src/source/Metrics/Metrics.c                  |    4 +-
+ src/source/PeerConnection/PeerConnection.c    |   16 +-
+ src/source/PeerConnection/PeerConnection.h    |    1 +
+ src/source/PeerConnection/Retransmitter.c     |   18 +-
+ src/source/PeerConnection/Rtp.c               |   96 +-
+ src/source/PeerConnection/Rtp.h               |   10 +-
+ .../PeerConnection/SessionDescription.c       |   96 +-
+ src/source/Sdp/Deserialize.c                  |    2 +
+ src/source/Sdp/Sdp.h                          |    2 +-
+ tst/PeerConnectionFunctionalityTest.cpp       |    8 +-
+ tst/RtcpFunctionalityTest.cpp                 |    8 +-
+ 24 files changed, 2595 insertions(+), 360 deletions(-)
+ create mode 100644 samples/kvsRtspError.h
+ create mode 100644 samples/kvsRtspSrc.c
+ create mode 100644 samples/kvsRtspSrc.h
+ create mode 100644 samples/kvsRtspSrcWrap.h
+ create mode 100644 samples/rtspconfig.txt
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index f3dc73f9e..17a9d8863 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -9,8 +9,8 @@ project(KinesisVideoWebRTCClient LANGUAGES C)
+ # User Flags
+ option(ADD_MUCLIBC "Add -muclibc c flag" OFF)
+ option(BUILD_DEPENDENCIES "Whether or not to build depending libraries from source" ON)
+-option(USE_OPENSSL "Use openssl as crypto library" ON)
+-option(USE_MBEDTLS "Use mbedtls as crypto library" OFF)
++option(USE_OPENSSL "Use openssl as crypto library" OFF)
++option(USE_MBEDTLS "Use mbedtls as crypto library" ON)
+ option(BUILD_STATIC_LIBS "Build all libraries statically. (This includes third-party libraries.)" OFF)
+ option(BUILD_OPENSSL_PLATFORM "If buildng OpenSSL what is the target platform" OFF)
+ option(BUILD_LIBSRTP_HOST_PLATFORM "If buildng LibSRTP what is the current platform" OFF)
+diff --git a/samples/Common.c b/samples/Common.c
+index b1588693c..ac52e69fd 100644
+--- a/samples/Common.c
++++ b/samples/Common.c
+@@ -19,14 +19,22 @@ STATUS signalingCallFailed(STATUS status)
+             STATUS_SIGNALING_GET_ICE_CONFIG_CALL_FAILED == status || STATUS_SIGNALING_CONNECT_CALL_FAILED == status);
+ }
+ 
++
++
++__attribute__((weak)) VOID processDataMessageString(PVOID args, PBYTE pMessage, UINT32 pMessageLen)
++{
++
++}
++
+ VOID onDataChannelMessage(UINT64 customData, PRtcDataChannel pDataChannel, BOOL isBinary, PBYTE pMessage, UINT32 pMessageLen)
+ {
+-    UNUSED_PARAM(customData);
+-    UNUSED_PARAM(pDataChannel);
++    PSampleStreamingSession pSampleStreamingSession = (PSampleStreamingSession) customData;
++
+     if (isBinary) {
+         DLOGI("DataChannel Binary Message");
+     } else {
+         DLOGI("DataChannel String Message: %.*s\n", pMessageLen, pMessage);
++        processDataMessageString(pSampleStreamingSession, pMessage, pMessageLen);
+     }
+     // Send a response to the message sent by the viewer
+     STATUS retStatus = STATUS_SUCCESS;
+@@ -203,7 +211,6 @@ STATUS handleOffer(PSampleConfiguration pSampleConfiguration, PSampleStreamingSe
+ 
+     MEMSET(&offerSessionDescriptionInit, 0x00, SIZEOF(RtcSessionDescriptionInit));
+     MEMSET(&pSampleStreamingSession->answerSessionDescriptionInit, 0x00, SIZEOF(RtcSessionDescriptionInit));
+-
+     CHK_STATUS(deserializeSessionDescriptionInit(pSignalingMessage->payload, pSignalingMessage->payloadLen, &offerSessionDescriptionInit));
+     CHK_STATUS(setRemoteDescription(pSampleStreamingSession->pPeerConnection, &offerSessionDescriptionInit));
+     canTrickle = canTrickleIceCandidates(pSampleStreamingSession->pPeerConnection);
+@@ -211,7 +218,6 @@ STATUS handleOffer(PSampleConfiguration pSampleConfiguration, PSampleStreamingSe
+     CHECK(!NULLABLE_CHECK_EMPTY(canTrickle));
+     pSampleStreamingSession->remoteCanTrickleIce = canTrickle.value;
+     CHK_STATUS(setLocalDescription(pSampleStreamingSession->pPeerConnection, &pSampleStreamingSession->answerSessionDescriptionInit));
+-
+     /*
+      * If remote support trickle ice, send answer now. Otherwise answer will be sent once ice candidate gathering is complete.
+      */
+@@ -352,6 +358,7 @@ STATUS initializePeerConnection(PSampleConfiguration pSampleConfiguration, PRtcP
+ 
+     // Set this to custom callback to enable filtering of interfaces
+     configuration.kvsRtcConfiguration.iceSetInterfaceFilterFunc = NULL;
++    configuration.kvsRtcConfiguration.videoMediaCount = pSampleConfiguration->numOfCameras;
+ 
+     // Set the ICE mode explicitly
+     configuration.iceTransportPolicy = ICE_TRANSPORT_POLICY_ALL;
+@@ -522,6 +529,10 @@ STATUS createSampleStreamingSession(PSampleConfiguration pSampleConfiguration, P
+                                                          sampleSenderBandwidthEstimationHandler));
+     pSampleStreamingSession->firstFrame = TRUE;
+     pSampleStreamingSession->startUpLatency = 0;
++
++    pSampleStreamingSession->sendMultiChannelPreview = 1;
++    pSampleStreamingSession->mainChannelId = 0;
++
+ CleanUp:
+ 
+     if (STATUS_FAILED(retStatus) && pSampleStreamingSession != NULL) {
+@@ -570,7 +581,6 @@ STATUS freeSampleStreamingSession(PSampleStreamingSession* ppSampleStreamingSess
+         pSampleConfiguration->iceCandidatePairStatsTimerId = MAX_UINT32;
+     }
+     MUTEX_UNLOCK(pSampleConfiguration->sampleConfigurationObjLock);
+-
+     CHK_LOG_ERR(closePeerConnection(pSampleStreamingSession->pPeerConnection));
+     CHK_LOG_ERR(freePeerConnection(&pSampleStreamingSession->pPeerConnection));
+     SAFE_MEMFREE(pSampleStreamingSession);
+@@ -1133,7 +1143,7 @@ STATUS sessionCleanupWait(PSampleConfiguration pSampleConfiguration)
+     STATUS retStatus = STATUS_SUCCESS;
+     PSampleStreamingSession pSampleStreamingSession = NULL;
+     UINT32 i, clientIdHash;
+-    BOOL locked = FALSE, peerConnectionFound = FALSE;
++    BOOL locked = FALSE, peerConnectionFound = FALSE, locked2 = FALSE;
+     SIGNALING_CLIENT_STATE signalingClientState;
+ 
+     CHK(pSampleConfiguration != NULL, STATUS_NULL_ARG);
+@@ -1147,8 +1157,8 @@ STATUS sessionCleanupWait(PSampleConfiguration pSampleConfiguration)
+         for (i = 0; i < pSampleConfiguration->streamingSessionCount; ++i) {
+             if (ATOMIC_LOAD_BOOL(&pSampleConfiguration->sampleStreamingSessionList[i]->terminateFlag)) {
+                 pSampleStreamingSession = pSampleConfiguration->sampleStreamingSessionList[i];
+-
+                 MUTEX_LOCK(pSampleConfiguration->streamingSessionListReadLock);
++                locked2 = TRUE;
+ 
+                 // swap with last element and decrement count
+                 pSampleConfiguration->streamingSessionCount--;
+@@ -1163,6 +1173,7 @@ STATUS sessionCleanupWait(PSampleConfiguration pSampleConfiguration)
+                 }
+ 
+                 MUTEX_UNLOCK(pSampleConfiguration->streamingSessionListReadLock);
++                locked2 = FALSE;
+ 
+                 CHK_STATUS(freeSampleStreamingSession(&pSampleStreamingSession));
+             }
+@@ -1204,6 +1215,9 @@ CleanUp:
+ 
+     CHK_LOG_ERR(retStatus);
+ 
++    if (locked2) {
++        MUTEX_UNLOCK(pSampleConfiguration->streamingSessionListReadLock);
++    }
+     if (locked) {
+         MUTEX_UNLOCK(pSampleConfiguration->sampleConfigurationObjLock);
+     }
+diff --git a/samples/Samples.h b/samples/Samples.h
+index 6b721a8d6..3b61ad2c8 100644
+--- a/samples/Samples.h
++++ b/samples/Samples.h
+@@ -12,11 +12,15 @@ extern "C" {
+ 
+ #include <com/amazonaws/kinesis/video/webrtcclient/Include.h>
+ 
+-#define NUMBER_OF_H264_FRAME_FILES               1500
++#define NUMBER_OF_H264_FRAME_FILES               499
+ #define NUMBER_OF_OPUS_FRAME_FILES               618
+-#define DEFAULT_FPS_VALUE                        25
++#define DEFAULT_FPS_VALUE                        15
+ #define DEFAULT_MAX_CONCURRENT_STREAMING_SESSION 10
+ 
++#define NUMBER_OF_H264_PREVIEW_FRAME_FILES       499
++#define DEFAULT_REVIEW_FPS_VALUE                 15
++
++
+ #define SAMPLE_MASTER_CLIENT_ID "ProducerMaster"
+ #define SAMPLE_VIEWER_CLIENT_ID "ConsumerViewer"
+ #define SAMPLE_CHANNEL_NAME     (PCHAR) "ScaryTestChannel"
+@@ -34,7 +38,7 @@ extern "C" {
+ 
+ #define CA_CERT_PEM_FILE_EXTENSION ".pem"
+ 
+-#define FILE_LOGGING_BUFFER_SIZE (100 * 1024)
++#define FILE_LOGGING_BUFFER_SIZE (60 * 1024)
+ #define MAX_NUMBER_OF_LOG_FILES  5
+ 
+ #define SAMPLE_HASH_TABLE_BUCKET_COUNT  50
+@@ -49,6 +53,16 @@ extern "C" {
+ #define MASTER_DATA_CHANNEL_MESSAGE "This message is from the KVS Master"
+ #define VIEWER_DATA_CHANNEL_MESSAGE "This message is from the KVS Viewer"
+ 
++
++#define APP_MEDIA_RTSP_URL                 ((PCHAR) "AWS_RTSP_URL")
++#define APP_MEDIA_RTSP_USERNAME            ((PCHAR) "AWS_RTSP_USERNAME")
++#define APP_MEDIA_RTSP_PASSWORD            ((PCHAR) "AWS_RTSP_PASSWORD")
++#define APP_MEDIA_RTSP_USERNAME_LEN        MAX_CHANNEL_NAME_LEN
++#define APP_MEDIA_RTSP_PASSWORD_LEN        MAX_CHANNEL_NAME_LEN
++#define APP_MEDIA_GST_ELEMENT_NAME_MAX_LEN 256
++
++#define MAX_RSTP_CAMERA_SUPPORTED 16
++
+ /* Uncomment the following line in order to enable IoT credentials checks in the provided samples */
+ //#define IOT_CORE_ENABLE_CREDENTIALS  1
+ 
+@@ -93,6 +107,12 @@ typedef struct {
+     startRoutine receiveAudioVideoSource;
+     RtcOnDataChannel onDataChannel;
+ 
++    UINT32 numOfCameras;
++    PVOID pMediaContextPreview[MAX_RSTP_CAMERA_SUPPORTED];
++    PVOID pMediaContextMain[MAX_RSTP_CAMERA_SUPPORTED];
++    TID rstpPreviewTid[MAX_RSTP_CAMERA_SUPPORTED];
++    TID rstpMainTid[MAX_RSTP_CAMERA_SUPPORTED];
++
+     PStackQueue pPendingSignalingMessageForRemoteClient;
+     PHashTable pRtcPeerConnectionForRemoteClient;
+ 
+@@ -143,6 +163,8 @@ struct __SampleStreamingSession {
+     BOOL firstFrame;
+     RtcMetricsHistory rtcMetricsHistory;
+     BOOL remoteCanTrickleIce;
++    volatile UINT32 sendMultiChannelPreview;
++    volatile UINT32 mainChannelId;
+ 
+     // this is called when the SampleStreamingSession is being freed
+     StreamSessionShutdownCallback shutdownCallback;
+@@ -188,6 +210,8 @@ STATUS submitPendingIceCandidate(PPendingMessageQueue, PSampleStreamingSession);
+ STATUS removeExpiredMessageQueues(PStackQueue);
+ STATUS getPendingMessageQueueForHash(PStackQueue, UINT64, BOOL, PPendingMessageQueue*);
+ BOOL sampleFilterNetworkInterfaces(UINT64, PCHAR);
++STATUS updateMultiStreamSourceState(PVOID);
++VOID processDataMessageString(PVOID, PBYTE, UINT32);
+ 
+ #ifdef __cplusplus
+ }
+diff --git a/samples/kvsRtspError.h b/samples/kvsRtspError.h
+new file mode 100644
+index 000000000..957c23812
+--- /dev/null
++++ b/samples/kvsRtspError.h
+@@ -0,0 +1,134 @@
++/*
++ * Copyright 2021 Amazon.com, Inc. or its affiliates. All Rights Reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License").
++ * You may not use this file except in compliance with the License.
++ * A copy of the License is located at
++ *
++ *  http://aws.amazon.com/apache2.0
++ *
++ * or in the "license" file accompanying this file. This file is distributed
++ * on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either
++ * express or implied. See the License for the specific language governing
++ * permissions and limitations under the License.
++ */
++#ifndef __KINESIS_VIDEO_WEBRTC_APP_ERROR_INCLUDE__
++#define __KINESIS_VIDEO_WEBRTC_APP_ERROR_INCLUDE__
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++/** 0x70000000 */
++#define STATUS_APP_BASE   0x70000000
++#define STATUS_APP_FAILED STATUS_APP_BASE + 0x00000001
++/** 0x71000000 */
++#define STATUS_APP_COMMON_BASE                         STATUS_APP_BASE + 0x01000000
++#define STATUS_APP_COMMON_NULL_ARG                     STATUS_APP_COMMON_BASE + 0x00000001
++#define STATUS_APP_COMMON_NOT_ENOUGH_MEMORY            STATUS_APP_COMMON_BASE + 0x00000002
++#define STATUS_APP_COMMON_SHUTDOWN_MEDIA               STATUS_APP_COMMON_BASE + 0x00000003
++#define STATUS_APP_COMMON_CHANNEL_NAME                 STATUS_APP_COMMON_BASE + 0x00000004
++#define STATUS_APP_COMMON_TIMER                        STATUS_APP_COMMON_BASE + 0x00000005
++#define STATUS_APP_COMMON_INVALID_PEER_ID              STATUS_APP_COMMON_BASE + 0x00000006
++#define STATUS_APP_COMMON_TRIGGER_MEDIA_SENDER_ROUTINE STATUS_APP_COMMON_BASE + 0x00000007
++#define STATUS_APP_COMMON_INVALID_MUTEX                STATUS_APP_COMMON_BASE + 0x00000008
++
++/** 0x72000000 */
++#define STATUS_APP_CREDENTIAL_BASE                    STATUS_APP_BASE + 0x02000000
++#define STATUS_APP_CREDENTIAL_MISS_CACERT_PATH        STATUS_APP_CREDENTIAL_BASE + 0x00000001
++#define STATUS_APP_CREDENTIAL_INVALID_CACERT_PATH     STATUS_APP_CREDENTIAL_BASE + 0x00000002
++#define STATUS_APP_CREDENTIAL_CACERT_NOT_FOUND        STATUS_APP_CREDENTIAL_BASE + 0x00000003
++#define STATUS_APP_CREDENTIAL_MISSING_ENV             STATUS_APP_CREDENTIAL_BASE + 0x00000004
++#define STATUS_APP_CREDENTIAL_ALLOCATE_STATIC         STATUS_APP_CREDENTIAL_BASE + 0x00000005
++#define STATUS_APP_CREDENTIAL_ALLOCATE_IOT            STATUS_APP_CREDENTIAL_BASE + 0x00000006
++#define STATUS_APP_CREDENTIAL_ALLOCATE_ECS            STATUS_APP_CREDENTIAL_BASE + 0x00000007
++#define STATUS_APP_CREDENTIAL_ALLOCATE_NA             STATUS_APP_CREDENTIAL_BASE + 0x00000008
++#define STATUS_APP_CREDENTIAL_DESTROY_STATIC          STATUS_APP_CREDENTIAL_BASE + 0x00000009
++#define STATUS_APP_CREDENTIAL_DESTROY_IOT             STATUS_APP_CREDENTIAL_BASE + 0x0000000A
++#define STATUS_APP_CREDENTIAL_DESTROY_ECS             STATUS_APP_CREDENTIAL_BASE + 0x0000000B
++#define STATUS_APP_CREDENTIAL_DESTROY_NA              STATUS_APP_CREDENTIAL_BASE + 0x0000000C
++#define STATUS_APP_CREDENTIAL_PREGENERATED_CERT_QUEUE STATUS_APP_CREDENTIAL_BASE + 0x0000000D
++#define STATUS_APP_CREDENTIAL_NULL_ARG                STATUS_APP_CREDENTIAL_BASE + 0x0000000E
++#define STATUS_APP_CREDENTIAL_INVALID_MUTEX           STATUS_APP_CREDENTIAL_BASE + 0x0000000F
++#define STATUS_APP_CREDENTIAL_CERT_CREATE             STATUS_APP_CREDENTIAL_BASE + 0x00000010
++#define STATUS_APP_CREDENTIAL_CERT_STACK              STATUS_APP_CREDENTIAL_BASE + 0x00000011
++/** 0x73000000 */
++#define STATUS_MEDIA_BASE              STATUS_APP_BASE + 0x03000000
++#define STATUS_MEDIA_NULL_ARG          STATUS_MEDIA_BASE + 0x00000001
++#define STATUS_MEDIA_NOT_ENOUGH_MEMORY STATUS_MEDIA_BASE + 0x00000002
++#define STATUS_MEDIA_INVALID_MUTEX     STATUS_MEDIA_BASE + 0x00000003
++#define STATUS_MEDIA_FAILED            STATUS_MEDIA_BASE + 0x00000004
++#define STATUS_MEDIA_INIT              STATUS_MEDIA_BASE + 0x00000005
++#define STATUS_MEDIA_NOT_READY         STATUS_MEDIA_BASE + 0x00000006
++#define STATUS_MEDIA_LINK_ELEMENT      STATUS_MEDIA_BASE + 0x00000007
++#define STATUS_MEDIA_EMPTY_ELEMENT     STATUS_MEDIA_BASE + 0x00000008
++#define STATUS_MEDIA_DUMMY_SINK        STATUS_MEDIA_BASE + 0x00000009
++#define STATUS_MEDIA_DUMMY_ELEMENT     STATUS_MEDIA_BASE + 0x0000000A
++#define STATUS_MEDIA_VIDEO_SINK        STATUS_MEDIA_BASE + 0x0000000B
++#define STATUS_MEDIA_VIDEO_ELEMENT     STATUS_MEDIA_BASE + 0x0000000C
++#define STATUS_MEDIA_VIDEO_CAPS        STATUS_MEDIA_BASE + 0x0000000D
++#define STATUS_MEDIA_VIDEO_QUEUE       STATUS_MEDIA_BASE + 0x0000000E
++#define STATUS_MEDIA_VIDEO_LINK        STATUS_MEDIA_BASE + 0x0000000F
++#define STATUS_MEDIA_AUDIO_SINK        STATUS_MEDIA_BASE + 0x00000010
++#define STATUS_MEDIA_AUDIO_ELEMENT     STATUS_MEDIA_BASE + 0x00000011
++#define STATUS_MEDIA_AUDIO_CAPS        STATUS_MEDIA_BASE + 0x00000012
++#define STATUS_MEDIA_AUDIO_QUEUE       STATUS_MEDIA_BASE + 0x00000013
++#define STATUS_MEDIA_AUDIO_LINK        STATUS_MEDIA_BASE + 0x00000014
++#define STATUS_MEDIA_UNSUPPORTED_VIDEO STATUS_MEDIA_BASE + 0x00000015
++#define STATUS_MEDIA_UNSUPPORTED_AUDIO STATUS_MEDIA_BASE + 0x00000016
++#define STATUS_MEDIA_RTSP_URL          STATUS_MEDIA_BASE + 0x00000017
++#define STATUS_MEDIA_RTSP_CREDENTIAL   STATUS_MEDIA_BASE + 0x00000018
++#define STATUS_MEDIA_RTSP_PASSWORD     STATUS_MEDIA_BASE + 0x00000019
++#define STATUS_MEDIA_MISSING_RESOURCE  STATUS_MEDIA_BASE + 0x0000001A
++#define STATUS_MEDIA_MISSING_PLUGIN    STATUS_MEDIA_BASE + 0x0000001B
++#define STATUS_MEDIA_MISSING_BUS       STATUS_MEDIA_BASE + 0x0000001C
++#define STATUS_MEDIA_MISSING_PIPELINE  STATUS_MEDIA_BASE + 0x0000001D
++#define STATUS_MEDIA_PLAY              STATUS_MEDIA_BASE + 0x0000001E
++#define STATUS_MEDIA_NOT_EXISTED       STATUS_MEDIA_BASE + 0x0000001F
++#define STATUS_MEDIA_PAYLOAD_CONFLICT  STATUS_MEDIA_BASE + 0x00000020
++#define STATUS_MEDIA_PAD_REMOVED       STATUS_MEDIA_BASE + 0x00000021
++#define STATUS_MEDIA_BUS_ERROR         STATUS_MEDIA_BASE + 0x00000022
++#define STATUS_MEDIA_BUS_EOS           STATUS_MEDIA_BASE + 0x00000023
++/** 0x74000000 */
++#define STATUS_APP_SIGNALING_BASE               STATUS_APP_BASE + 0x04000000
++#define STATUS_APP_SIGNALING_NULL_ARG           STATUS_APP_SIGNALING_BASE + 0x00000001
++#define STATUS_APP_SIGNALING_NOT_ENOUGH_MEMORY  STATUS_APP_SIGNALING_BASE + 0x00000002
++#define STATUS_APP_SIGNALING_INVALID_OPERATION  STATUS_APP_SIGNALING_BASE + 0x00000003
++#define STATUS_APP_SIGNALING_INVALID_HANDLE     STATUS_APP_SIGNALING_BASE + 0x00000004
++#define STATUS_APP_SIGNALING_INVALID_MUTEX      STATUS_APP_SIGNALING_BASE + 0x00000005
++#define STATUS_APP_SIGNALING_INVALID_INFO_COUNT STATUS_APP_SIGNALING_BASE + 0x00000006
++#define STATUS_APP_SIGNALING_INVALID_INFO       STATUS_APP_SIGNALING_BASE + 0x00000007
++#define STATUS_APP_SIGNALING_CREATE             STATUS_APP_SIGNALING_BASE + 0x00000008
++#define STATUS_APP_SIGNALING_CONNECT            STATUS_APP_SIGNALING_BASE + 0x00000009
++#define STATUS_APP_SIGNALING_FREE               STATUS_APP_SIGNALING_BASE + 0x0000000A
++#define STATUS_APP_SIGNALING_NOT_READY          STATUS_APP_SIGNALING_BASE + 0x0000000B
++#define STATUS_APP_SIGNALING_RESTART            STATUS_APP_SIGNALING_BASE + 0x0000000C
++#define STATUS_APP_SIGNALING_SEND               STATUS_APP_SIGNALING_BASE + 0x0000000D
++#define STATUS_APP_SIGNALING_ICE_SERVER_COUNT   STATUS_APP_SIGNALING_BASE + 0x0000000E
++/** 0x75000000 */
++#define STATUS_APP_WEBRTC_BASE   STATUS_APP_BASE + 0x05000000
++#define STATUS_APP_WEBRTC_INIT   STATUS_APP_WEBRTC_BASE + 0x00000001
++#define STATUS_APP_WEBRTC_DEINIT STATUS_APP_WEBRTC_BASE + 0x00000002
++/** 0x76000000 */
++#define STATUS_APP_METRICS_BASE                 STATUS_APP_BASE + 0x06000000
++#define STATUS_APP_METRICS_NULL_ARG             STATUS_APP_METRICS_BASE + 0x00000001
++#define STATUS_APP_METRICS_SETUP_LOGGER         STATUS_APP_METRICS_BASE + 0x00000002
++#define STATUS_APP_METRICS_FREE_LOGGER          STATUS_APP_METRICS_BASE + 0x00000003
++#define STATUS_APP_METRICS_ICE_SERVER           STATUS_APP_METRICS_BASE + 0x00000004
++#define STATUS_APP_METRICS_LOCAL_ICE_CANDIDATE  STATUS_APP_METRICS_BASE + 0x00000005
++#define STATUS_APP_METRICS_REMOTE_ICE_CANDIDATE STATUS_APP_METRICS_BASE + 0x00000006
++/** 0x77000000 */
++#define STATUS_APP_MSGQ_BASE               STATUS_APP_BASE + 0x07000000
++#define STATUS_APP_MSGQ_NULL_ARG           STATUS_APP_MSGQ_BASE + 0x00000001
++#define STATUS_APP_MSGQ_NOT_ENOUGH_MEMORY  STATUS_APP_MSGQ_BASE + 0x00000002
++#define STATUS_APP_MSGQ_CREATE_CONN_MSQ    STATUS_APP_MSGQ_BASE + 0x00000003
++#define STATUS_APP_MSGQ_PUSH_CONN_MSQ      STATUS_APP_MSGQ_BASE + 0x00000004
++#define STATUS_APP_MSGQ_CREATE_PENDING_MSQ STATUS_APP_MSGQ_BASE + 0x00000005
++#define STATUS_APP_MSGQ_HANDLE_PENDING_MSQ STATUS_APP_MSGQ_BASE + 0x00000006
++#define STATUS_APP_MSGQ_PUSH_PENDING_MSQ   STATUS_APP_MSGQ_BASE + 0x00000007
++#define STATUS_APP_MSGQ_EMPTY_PENDING_MSQ  STATUS_APP_MSGQ_BASE + 0x00000008
++#define STATUS_APP_MSGQ_POP_PENDING_MSQ    STATUS_APP_MSGQ_BASE + 0x00000009
++
++#ifdef __cplusplus
++}
++#endif
++#endif /* __KINESIS_VIDEO_WEBRTC_APP_ERROR_INCLUDE__ */
+diff --git a/samples/kvsRtspSrc.c b/samples/kvsRtspSrc.c
+new file mode 100644
+index 000000000..cea0326d4
+--- /dev/null
++++ b/samples/kvsRtspSrc.c
+@@ -0,0 +1,1131 @@
++/*
++ * Copyright 2021 Amazon.com, Inc. or its affiliates. All Rights Reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License").
++ * You may not use this file except in compliance with the License.
++ * A copy of the License is located at
++ *
++ *  http://aws.amazon.com/apache2.0
++ *
++ * or in the "license" file accompanying this file. This file is distributed
++ * on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either
++ * express or implied. See the License for the specific language governing
++ * permissions and limitations under the License.
++ */
++#define LOG_CLASS "kvsRtspSrc"
++#include "Samples.h"
++#include "kvsRtspSrc.h"
++#include "kvsRtspSrcWrap.h"
++#include "kvsRtspError.h"
++
++static MUTEX gCodecConfLock;
++static MUTEX gMediaSrcConfLock;
++
++static void updateCodecStatus(PRtspSrcContext pRtspSrcContext, STATUS retStatus)
++{
++    PCodecConfiguration pGstConfiguration = &pRtspSrcContext->codecConfiguration;
++    MUTEX_LOCK(gCodecConfLock);
++    pGstConfiguration->codecStatus = retStatus;
++    MUTEX_UNLOCK(gCodecConfLock);
++}
++/**
++ * @brief quitting the main loop of gstreamer.
++ *
++ * @param[in] the context of rtspsrc.
++ *
++ * @return STATUS code of the execution. STATUS_SUCCESS on success
++ */
++static STATUS closeGstRtspSrc(PRtspSrcContext pRtspSrcContext)
++{
++    STATUS retStatus = STATUS_SUCCESS;
++
++    MUTEX_LOCK(gCodecConfLock);
++    PCodecConfiguration pGstConfiguration = &pRtspSrcContext->codecConfiguration;
++    DLOGD("closing the gst rtspsrc. id = %d", pGstConfiguration->id);
++    if (pGstConfiguration->mainLoop != NULL) {
++        app_g_main_loop_quit(pGstConfiguration->mainLoop);
++    }
++    ATOMIC_STORE_BOOL(&pRtspSrcContext->shutdownRtspSrc, FALSE);
++    MUTEX_UNLOCK(gCodecConfLock);
++    return retStatus;
++}
++/**
++ * @brief the callback is invoked when the error happens on the bus.
++ *
++ * @param[in] bus the bus of the callback.
++ * @param[in] msg the msg of the callback.
++ * @param[in] udata the user data.
++ *
++ * @return STATUS code of the execution. STATUS_SUCCESS on success
++ */
++static void onMsgErrorFromBus(GstBus* bus, GstMessage* msg, gpointer* udata)
++{
++    STATUS retStatus = STATUS_SUCCESS;
++    GError* err;
++    gchar* debug_info;
++    PRtspSrcContext pRtspSrcContext = NULL;
++    PCodecConfiguration pGstConfiguration;
++
++    CHK((bus != NULL) && (msg != NULL) && (udata != NULL), STATUS_NULL_ARG);
++    pRtspSrcContext = (PRtspSrcContext) udata;
++    pGstConfiguration = &pRtspSrcContext->codecConfiguration;
++    app_gst_message_parse_error(msg, &err, &debug_info);
++    if (err != NULL) {
++        DLOGE("error code: %d: %d", err->code, GST_RTSP_EINVAL);
++        DLOGE("error received from element %s: %s\n", app_gst_object_get_name(msg->src), err->message);
++    }
++    if (debug_info != NULL) {
++        DLOGE("debugging information: %s\n", debug_info);
++    }
++    closeGstRtspSrc(pRtspSrcContext);
++
++CleanUp:
++    app_g_error_free(err);
++    app_g_free(debug_info);
++
++    if (pRtspSrcContext != NULL) {
++        updateCodecStatus(pRtspSrcContext, STATUS_MEDIA_BUS_ERROR);
++    }
++
++    return;
++}
++/**
++ * @brief the callback is invoked when the end of stream happens on the bus.
++ *
++ * @param[in] bus the bus of the callback.
++ * @param[in] msg the msg of the callback.
++ * @param[in] udata the user data.
++ *
++ * @return STATUS code of the execution. STATUS_SUCCESS on success
++ */
++static void onMsgEosFromBus(GstBus* bus, GstMessage* msg, gpointer* udata)
++{
++    STATUS retStatus = STATUS_SUCCESS;
++    PRtspSrcContext pRtspSrcContext = (PRtspSrcContext) udata;
++    PCodecConfiguration pGstConfiguration;
++
++    CHK((bus != NULL) && (msg != NULL) && (udata != NULL), STATUS_NULL_ARG);
++    pGstConfiguration = &pRtspSrcContext->codecConfiguration;
++    closeGstRtspSrc(pRtspSrcContext);
++    if (pRtspSrcContext->mediaEosHook != NULL) {
++        retStatus = pRtspSrcContext->mediaEosHook(pRtspSrcContext->mediaEosHookUserdata);
++    }
++
++CleanUp:
++
++    if (pRtspSrcContext != NULL) {
++        updateCodecStatus(pRtspSrcContext, STATUS_MEDIA_BUS_EOS);
++    }
++
++    return;
++}
++/**
++ * @brief the callback is invoked when the sample of stream comes.
++ *
++ * @param[in] bus the sink of the callback.
++ * @param[in] udata the user data.
++ * @param[in] trackid the track id of the callback.
++ *
++ * @return STATUS code of the execution. STATUS_SUCCESS on success
++ */
++static GstFlowReturn onNewSampleFromAppSink(GstElement* sink, gpointer udata, UINT64 trackid)
++{
++    STATUS retStatus = STATUS_SUCCESS;
++    PRtspSrcContext pRtspSrcContext = (PRtspSrcContext) udata;
++    Frame frame;
++    BOOL isDroppable, delta;
++    GstFlowReturn gstFlowReturn = GST_FLOW_OK;
++    GstSample* sample = NULL;
++    GstBuffer* buffer;
++    GstMapInfo info;
++    GstSegment* segment;
++    GstClockTime buf_pts;
++
++    info.data = NULL;
++    CHK((sink != NULL) && (pRtspSrcContext != NULL), STATUS_NULL_ARG);
++
++    sample = app_gst_app_sink_pull_sample(APP_GST_APP_SINK(sink));
++    buffer = app_gst_sample_get_buffer(sample);
++
++    isDroppable = GST_BUFFER_FLAG_IS_SET(buffer, GST_BUFFER_FLAG_CORRUPTED) || //!< the buffer data is corrupted.
++        GST_BUFFER_FLAG_IS_SET(buffer, GST_BUFFER_FLAG_DECODE_ONLY) || (GST_BUFFER_FLAGS(buffer) == GST_BUFFER_FLAG_DISCONT) ||
++        (GST_BUFFER_FLAG_IS_SET(buffer, GST_BUFFER_FLAG_DISCONT) && GST_BUFFER_FLAG_IS_SET(buffer, GST_BUFFER_FLAG_DELTA_UNIT)) ||
++        // drop if buffer contains header only and has invalid timestamp
++        !GST_BUFFER_PTS_IS_VALID(buffer);
++
++    if (!isDroppable) {
++        delta = GST_BUFFER_FLAG_IS_SET(buffer, GST_BUFFER_FLAG_DELTA_UNIT);
++
++        frame.flags = delta ? FRAME_FLAG_NONE : FRAME_FLAG_KEY_FRAME;
++        segment = app_gst_sample_get_segment(sample);
++        buf_pts = app_gst_segment_to_running_time(segment, GST_FORMAT_TIME, buffer->pts);
++        if (!GST_CLOCK_TIME_IS_VALID(buf_pts)) {
++            DLOGI("frame contains invalid PTS, dropping the frame.");
++            goto CleanUp;
++        }
++        if (!(app_gst_buffer_map(buffer, &info, GST_MAP_READ))) {
++            DLOGI("media buffer mapping failed");
++            goto CleanUp;
++        }
++        frame.trackId = trackid;
++        frame.duration = 0;
++        frame.version = FRAME_CURRENT_VERSION;
++        frame.size = (UINT32) info.size;
++        frame.frameData = (PBYTE) info.data;
++        frame.presentationTs = buf_pts * DEFAULT_TIME_UNIT_IN_NANOS;
++        frame.decodingTs = frame.presentationTs;
++        if (pRtspSrcContext->mediaSinkHook != NULL) {
++            retStatus = pRtspSrcContext->mediaSinkHook(pRtspSrcContext->mediaSinkHookUserdata, &frame);
++        }
++    }
++
++CleanUp:
++
++    if (info.data != NULL) {
++        app_gst_buffer_unmap(buffer, &info);
++    }
++    if (sample != NULL) {
++        app_gst_sample_unref(sample);
++    }
++    if (STATUS_FAILED(retStatus)) {
++        gstFlowReturn = GST_FLOW_EOS;
++    }
++    if (pRtspSrcContext != NULL && (gstFlowReturn == GST_FLOW_EOS || ATOMIC_LOAD_BOOL(&pRtspSrcContext->shutdownRtspSrc))) {
++        DLOGD("close rtsp");
++        closeGstRtspSrc(pRtspSrcContext);
++    }
++    return gstFlowReturn;
++}
++/**
++ * @brief the callback is invoked when the video sample of stream comes.
++ *
++ * @param[in] bus the sink of the callback.
++ * @param[in] udata the user data.
++ *
++ * @return STATUS code of the execution. STATUS_SUCCESS on success
++ */
++static GstFlowReturn onNewSampleFromVideoAppSink(GstElement* sink, gpointer udata)
++{
++    // return onNewSampleFromAppSink(sink, udata, DEFAULT_VIDEO_TRACK_ID);
++    PRtspSrcContext pRtspSrcContext = (PRtspSrcContext) udata;
++
++    return on_new_sample(sink, udata, pRtspSrcContext->codecConfiguration.id);
++}
++/**
++ * @brief the callback is invoked when the audio sample of stream comes.
++ *
++ * @param[in] bus the sink of the callback.
++ * @param[in] udata the user data.
++ *
++ * @return STATUS code of the execution. STATUS_SUCCESS on success
++ */
++static GstFlowReturn onNewSampleFromAudioAppSink(GstElement* sink, gpointer udata)
++{
++    return onNewSampleFromAppSink(sink, udata, DEFAULT_AUDIO_TRACK_ID);
++}
++/**
++ * @brief the dummy sink for the output of rtspsrc.
++ *
++ * @param[in] pRtspSrcContext the context of rtspsrc.
++ * @param[in, out] ppDummySink the pointer of the dummy element.
++ * @param[in] name the name of this applink.
++ *
++ * @return STATUS code of the execution. STATUS_SUCCESS on success.
++ */
++static STATUS createDummyAppSink(PRtspSrcContext pRtspSrcContext, GstElement** ppDummySink, PCHAR name)
++{
++    STATUS retStatus = STATUS_SUCCESS;
++    CHAR elementName[APP_MEDIA_GST_ELEMENT_NAME_MAX_LEN];
++    GstElement* pipeline;
++    GstElement* dummySink = NULL;
++
++    MUTEX_LOCK(gCodecConfLock);
++
++    pipeline = (GstElement*) pRtspSrcContext->codecConfiguration.pipeline;
++    SNPRINTF(elementName, APP_MEDIA_GST_ELEMENT_NAME_MAX_LEN, "dummySink%s", name);
++    dummySink = app_gst_element_factory_make(GST_ELEMENT_FACTORY_NAME_FAKE_SINK, elementName);
++    CHK(dummySink != NULL, STATUS_MEDIA_DUMMY_SINK);
++    app_gst_bin_add_many(APP_GST_BIN(pipeline), dummySink, NULL);
++
++CleanUp:
++    // release the resource when we fail to create the pipeline.
++    if (STATUS_FAILED(retStatus)) {
++        app_gst_object_unref(dummySink);
++    }
++
++    MUTEX_UNLOCK(gCodecConfLock);
++
++    *ppDummySink = dummySink;
++    return retStatus;
++}
++/**
++ * @brief the video sink for the output of rtspsrc.
++ *
++ * @param[in] pRtspSrcContext the context of rtspsrc.
++ * @param[in, out] ppVideoQueue the pointer of the video sink.
++ * @param[in] name the name of this applink.
++ *
++ * @return STATUS code of the execution. STATUS_SUCCESS on success.
++ */
++static STATUS createVideoAppSink(PRtspSrcContext pRtspSrcContext, GstElement** ppVideoQueue, PCHAR name)
++{
++    STATUS retStatus = STATUS_SUCCESS;
++    CHAR elementName[APP_MEDIA_GST_ELEMENT_NAME_MAX_LEN];
++    PCodecStreamConf pCodecStreamConf;
++    GstElement* pipeline;
++    GstElement* videoQueue = NULL;
++    GstElement *videoDepay = NULL, *videoFilter = NULL, *videoAppSink = NULL;
++    GstCaps* videoCaps = NULL;
++
++    MUTEX_LOCK(gCodecConfLock);
++
++    pCodecStreamConf = &pRtspSrcContext->codecConfiguration.videoStream;
++    pipeline = (GstElement*) pRtspSrcContext->codecConfiguration.pipeline;
++
++    SNPRINTF(elementName, APP_MEDIA_GST_ELEMENT_NAME_MAX_LEN, "videoQueue%s", name);
++    videoQueue = app_gst_element_factory_make(GST_ELEMENT_FACTORY_NAME_QUEUE, elementName);
++
++    if (pCodecStreamConf->codec == RTC_CODEC_H264_PROFILE_42E01F_LEVEL_ASYMMETRY_ALLOWED_PACKETIZATION_MODE) {
++        if(pRtspSrcContext->codecConfiguration.preview) {
++            SNPRINTF(elementName, APP_MEDIA_GST_ELEMENT_NAME_MAX_LEN, "videoDepayPreview%d", pRtspSrcContext->codecConfiguration.id);
++        } else {
++            SNPRINTF(elementName, APP_MEDIA_GST_ELEMENT_NAME_MAX_LEN, "videoDepayMain%d", pRtspSrcContext->codecConfiguration.id);
++        }
++        videoDepay = app_gst_element_factory_make(GST_ELEMENT_FACTORY_NAME_RTP_DEPAY_H264, elementName);
++        videoCaps = app_gst_caps_new_simple("video/x-h264", "stream-format", G_TYPE_STRING, "byte-stream", "alignment", G_TYPE_STRING, "au", NULL);
++    } else {
++        // this case is RTC_CODEC_VP8.
++        videoDepay = app_gst_element_factory_make(GST_ELEMENT_FACTORY_NAME_RTP_DEPAY_VP8, "videoDepay");
++        videoCaps = app_gst_caps_new_simple("video/x-vp8", "profile", G_TYPE_STRING, "0", NULL);
++    }
++
++    CHK(videoCaps != NULL, STATUS_MEDIA_VIDEO_CAPS);
++
++    if(pRtspSrcContext->codecConfiguration.preview) {
++        SNPRINTF(elementName, APP_MEDIA_GST_ELEMENT_NAME_MAX_LEN, "videoFilterPreview%d", pRtspSrcContext->codecConfiguration.id);
++    } else {
++        SNPRINTF(elementName, APP_MEDIA_GST_ELEMENT_NAME_MAX_LEN, "videoFilterMain%d", pRtspSrcContext->codecConfiguration.id);
++    }
++    videoFilter = app_gst_element_factory_make(GST_ELEMENT_FACTORY_NAME_CAPS_FILTER, elementName);
++    if(pRtspSrcContext->codecConfiguration.preview) {
++        SNPRINTF(elementName, APP_MEDIA_GST_ELEMENT_NAME_MAX_LEN, "videoAppSinkPreview%d", pRtspSrcContext->codecConfiguration.id);
++    } else {
++        SNPRINTF(elementName, APP_MEDIA_GST_ELEMENT_NAME_MAX_LEN, "videoAppSinkMain%d", pRtspSrcContext->codecConfiguration.id);
++    }
++    videoAppSink = app_gst_element_factory_make(GST_ELEMENT_FACTORY_NAME_APP_SINK, elementName);
++
++    CHK(videoQueue != NULL, STATUS_MEDIA_VIDEO_QUEUE);
++    CHK((videoDepay != NULL) && (videoFilter != NULL) && (videoAppSink != NULL), STATUS_MEDIA_VIDEO_ELEMENT);
++
++    app_g_object_set(APP_G_OBJECT(videoFilter), "caps", videoCaps, NULL);
++    app_gst_caps_unref(videoCaps);
++    videoCaps = NULL;
++    // configure appsink
++    app_g_object_set(APP_G_OBJECT(videoAppSink), "emit-signals", TRUE, "sync", FALSE, NULL);
++    app_g_signal_connect(videoAppSink, GST_SIGNAL_CALLBACK_NEW_SAMPLE, G_CALLBACK(onNewSampleFromVideoAppSink), pRtspSrcContext);
++    // link all the elements.
++    app_gst_bin_add_many(APP_GST_BIN(pipeline), videoQueue, videoDepay, videoFilter, videoAppSink, NULL);
++    CHK(app_gst_element_link_many(videoQueue, videoDepay, videoFilter, videoAppSink, NULL), STATUS_MEDIA_VIDEO_LINK);
++
++CleanUp:
++    // release the resource when we fail to create the pipeline.
++    if (STATUS_FAILED(retStatus)) {
++        app_gst_object_unref(videoQueue);
++        videoQueue = NULL;
++        app_gst_object_unref(videoDepay);
++        app_gst_object_unref(videoCaps);
++        app_gst_object_unref(videoFilter);
++        app_gst_object_unref(videoAppSink);
++    }
++    MUTEX_UNLOCK(gCodecConfLock);
++
++    *ppVideoQueue = videoQueue;
++    return retStatus;
++}
++/**
++ * @brief the audio sink for the output of rtspsrc.
++ *
++ * @param[in] pRtspSrcContext the context of rtspsrc.
++ * @param[in, out] ppAudioQueue the pointer of the audio sink.
++ * @param[in] name the name of this applink.
++ *
++ * @return STATUS code of the execution. STATUS_SUCCESS on success.
++ */
++static STATUS createAudioAppSink(PRtspSrcContext pRtspSrcContext, GstElement** ppAudioQueue, PCHAR name)
++{
++    STATUS retStatus = STATUS_SUCCESS;
++    PCodecStreamConf pCodecStreamConf;
++    CHAR elementName[APP_MEDIA_GST_ELEMENT_NAME_MAX_LEN];
++    GstElement* pipeline;
++    GstElement* audioQueue = NULL;
++    GstElement *audioDepay = NULL, *audioFilter = NULL, *audioAppSink = NULL;
++    GstCaps* audioCaps = NULL;
++
++    MUTEX_LOCK(gCodecConfLock);
++
++    pCodecStreamConf = &pRtspSrcContext->codecConfiguration.audioStream;
++    pipeline = (GstElement*) pRtspSrcContext->codecConfiguration.pipeline;
++
++    SNPRINTF(elementName, APP_MEDIA_GST_ELEMENT_NAME_MAX_LEN, "audioQueue%s", name);
++    audioQueue = app_gst_element_factory_make(GST_ELEMENT_FACTORY_NAME_QUEUE, elementName);
++    if (pCodecStreamConf->codec == RTC_CODEC_OPUS) {
++        audioDepay = app_gst_element_factory_make(GST_ELEMENT_FACTORY_NAME_RTP_DEPAY_OPUS, "audioDepay");
++        audioCaps = app_gst_caps_new_simple("audio/x-opus", "rate", G_TYPE_INT, 48000, "channels", G_TYPE_INT, 2, NULL);
++    } else if (pCodecStreamConf->codec == RTC_CODEC_MULAW) {
++        audioDepay = app_gst_element_factory_make(GST_ELEMENT_FACTORY_NAME_RTP_DEPAY_PCMU, "audioDepay");
++        audioCaps = app_gst_caps_new_simple("audio/x-mulaw", "rate", G_TYPE_INT, 8000, "channels", G_TYPE_INT, 1, NULL);
++    } else {
++        // This case is RTC_CODEC_ALAW.
++        audioDepay = app_gst_element_factory_make(GST_ELEMENT_FACTORY_NAME_RTP_DEPAY_PCMA, "audioDepay");
++        audioCaps = app_gst_caps_new_simple("audio/x-alaw", "rate", G_TYPE_INT, 8000, "channels", G_TYPE_INT, 1, NULL);
++    }
++
++    CHK(audioCaps != NULL, STATUS_MEDIA_AUDIO_CAPS);
++
++    audioFilter = app_gst_element_factory_make(GST_ELEMENT_FACTORY_NAME_CAPS_FILTER, "audioFilter");
++    audioAppSink = app_gst_element_factory_make(GST_ELEMENT_FACTORY_NAME_APP_SINK, "audioAppSink");
++
++    CHK(audioQueue != NULL, STATUS_MEDIA_AUDIO_QUEUE);
++    CHK((audioDepay != NULL) && (audioFilter != NULL) && (audioAppSink != NULL), STATUS_MEDIA_AUDIO_ELEMENT);
++
++    app_g_object_set(APP_G_OBJECT(audioFilter), "caps", audioCaps, NULL);
++    app_gst_caps_unref(audioCaps);
++    audioCaps = NULL;
++
++    app_g_object_set(APP_G_OBJECT(audioAppSink), "emit-signals", TRUE, "sync", FALSE, NULL);
++    app_g_signal_connect(audioAppSink, GST_SIGNAL_CALLBACK_NEW_SAMPLE, G_CALLBACK(onNewSampleFromAudioAppSink), pRtspSrcContext);
++    app_gst_bin_add_many(APP_GST_BIN(pipeline), audioQueue, audioDepay, audioFilter, audioAppSink, NULL);
++    CHK(app_gst_element_link_many(audioQueue, audioDepay, audioFilter, audioAppSink, NULL), STATUS_MEDIA_AUDIO_LINK);
++
++CleanUp:
++    // release the resource when we fail to create the pipeline.
++    if (STATUS_FAILED(retStatus)) {
++        app_gst_object_unref(audioQueue);
++        audioQueue = NULL;
++        app_gst_object_unref(audioDepay);
++        app_gst_object_unref(audioFilter);
++        app_gst_object_unref(audioAppSink);
++    }
++
++    MUTEX_UNLOCK(gCodecConfLock);
++
++    *ppAudioQueue = audioQueue;
++    return retStatus;
++}
++/**
++ * @brief   the callback is invoked when the pad is added.
++ *
++ * @param[in] element the element.
++ * @param[in] pad the pad of the element.
++ * @param[in] udata the user data.
++ *
++ * @return STATUS code of the execution. STATUS_SUCCESS on success.
++ */
++static void onRtspSrcPadAddedDiscovery(GstElement* element, GstPad* pad, gpointer udata)
++{
++    STATUS retStatus = STATUS_SUCCESS;
++    PRtspSrcContext pRtspSrcContext = (PRtspSrcContext) udata;
++    PCodecConfiguration pGstConfiguration = NULL;
++    PCodecStreamConf pCodecStreamConf = NULL;
++    BOOL video = FALSE;
++    BOOL audio = FALSE;
++    // gstreamer
++    gchar* srcPadName = NULL;
++    GstCaps* srcPadTemplateCaps = NULL;
++    GstCaps* srcPadCurrentCaps = NULL;
++    GstStructure* srcPadStructure = NULL;
++    GstElement* nextElement = NULL;
++    gchar* media = NULL;
++    guint curCapsNum;
++    BOOL locked = FALSE;
++    guint i;
++
++    CHK((element != NULL) && (pad != NULL) && (pRtspSrcContext != NULL), STATUS_NULL_ARG);
++    pGstConfiguration = &pRtspSrcContext->codecConfiguration;
++    srcPadName = app_gst_pad_get_name(pad);
++    srcPadTemplateCaps = app_gst_pad_get_pad_template_caps(pad);
++    DLOGD("new pad template %s was created", srcPadName);
++    srcPadCurrentCaps = app_gst_pad_get_current_caps(pad);
++    curCapsNum = app_gst_caps_get_size(srcPadCurrentCaps);
++
++    MUTEX_LOCK(gCodecConfLock);
++    locked = TRUE;
++    for (i = 0; i < curCapsNum; i++) {
++        srcPadStructure = app_gst_caps_get_structure(srcPadCurrentCaps, i);
++        pCodecStreamConf = NULL;
++
++        if (app_gst_structure_has_field(srcPadStructure, GST_STRUCT_FIELD_MEDIA) == TRUE &&
++            app_gst_structure_has_field(srcPadStructure, GST_STRUCT_FIELD_ENCODING) == TRUE) {
++            media = app_gst_structure_get_string(srcPadStructure, GST_STRUCT_FIELD_MEDIA);
++            const gchar* encoding_name = app_gst_structure_get_string(srcPadStructure, GST_STRUCT_FIELD_ENCODING);
++            DLOGD("media:%s, encoding_name:%s", media, encoding_name);
++
++            if (STRCMP(media, GST_STRUCT_FIELD_MEDIA_VIDEO) == 0) {
++                video = TRUE;
++                pCodecStreamConf = &pGstConfiguration->videoStream;
++                // h264
++                if (STRCMP(encoding_name, GST_STRUCT_FIELD_ENCODING_H264) == 0) {
++                    pCodecStreamConf->codec = RTC_CODEC_H264_PROFILE_42E01F_LEVEL_ASYMMETRY_ALLOWED_PACKETIZATION_MODE;
++                    // vp8
++                } else if (STRCMP(encoding_name, GST_STRUCT_FIELD_ENCODING_VP8) == 0) {
++                    pCodecStreamConf->codec = RTC_CODEC_VP8;
++                    // others
++                } else {
++                    DLOGW("unsupported video format");
++                    continue;
++                }
++            } else if (STRCMP(media, GST_STRUCT_FIELD_MEDIA_AUDIO) == 0) {
++                audio = TRUE;
++                pCodecStreamConf = &pGstConfiguration->audioStream;
++                if (STRCMP(encoding_name, GST_STRUCT_FIELD_ENCODING_PCMU) == 0) {
++                    pCodecStreamConf->codec = RTC_CODEC_MULAW;
++                } else if (STRCMP(encoding_name, GST_STRUCT_FIELD_ENCODING_PCMA) == 0) {
++                    pCodecStreamConf->codec = RTC_CODEC_ALAW;
++                } else if (STRCMP(encoding_name, GST_STRUCT_FIELD_ENCODING_OPUS) == 0) {
++                    pCodecStreamConf->codec = RTC_CODEC_OPUS;
++                } else {
++                    DLOGW("unsupported audio format");
++                    continue;
++                }
++            } else {
++                DLOGW("unsupported media format");
++                continue;
++            }
++            DLOGD("codec:%d", pCodecStreamConf->codec);
++            if (app_gst_structure_has_field(srcPadStructure, GST_STRUCT_FIELD_PAYLOAD_TYPE) == TRUE) {
++                gint payloadType;
++                app_gst_structure_get_int(srcPadStructure, GST_STRUCT_FIELD_PAYLOAD_TYPE, &payloadType);
++                DLOGD("payload:%d", payloadType);
++                pCodecStreamConf->payloadType = payloadType;
++            }
++            if (app_gst_structure_has_field(srcPadStructure, GST_STRUCT_FIELD_CLOCK_RATE) == TRUE) {
++                gint clock_rate;
++                app_gst_structure_get_int(srcPadStructure, GST_STRUCT_FIELD_CLOCK_RATE, &clock_rate);
++                DLOGD("clock-rate:%d", clock_rate);
++                pCodecStreamConf->clockRate = clock_rate;
++            }
++        }
++    }
++
++    CHK_STATUS((createDummyAppSink(pRtspSrcContext, &nextElement, media)));
++    CHK(app_gst_element_link_filtered(element, nextElement, srcPadTemplateCaps) == TRUE, STATUS_MEDIA_LINK_ELEMENT);
++
++CleanUp:
++    if (locked) {
++        MUTEX_UNLOCK(gCodecConfLock);
++    }
++    if (srcPadName != NULL) {
++        app_g_free(srcPadName);
++    }
++    if (srcPadCurrentCaps != NULL) {
++        app_gst_caps_unref(srcPadCurrentCaps);
++    }
++    if (srcPadTemplateCaps != NULL) {
++        app_gst_caps_unref(srcPadTemplateCaps);
++    }
++    if (STATUS_FAILED(retStatus)) {
++        DLOGE("operation returned status code: 0x%08x", retStatus);
++        if (nextElement != NULL) {
++            app_gst_object_unref(nextElement);
++        }
++        if (pRtspSrcContext != NULL) {
++            closeGstRtspSrc(pRtspSrcContext);
++            updateCodecStatus(pRtspSrcContext, STATUS_MEDIA_BUS_ERROR);
++        }
++    }
++}
++/**
++ * @brief   the callback is invoked when there is no pads coming.
++ *
++ * @param[in] element the element.
++ * @param[in] udata the user data.
++ *
++ * @return STATUS code of the execution. STATUS_SUCCESS on success.
++ */
++static void onRtspSrcNoMorePadsDiscovery(GstElement* element, gpointer udata)
++{
++    PRtspSrcContext pRtspSrcContext = (PRtspSrcContext) udata;
++    ATOMIC_STORE_BOOL(&pRtspSrcContext->codecConfigLatched, TRUE);
++    DLOGD("no more pads.");
++    closeGstRtspSrc(pRtspSrcContext);
++}
++/**
++ * @brief   the callback is invoked when the pad is added.
++ *
++ * @param[in] element the element.
++ * @param[in] pad the pad of the element.
++ * @param[in] udata the user data.
++ *
++ * @return STATUS code of the execution. STATUS_SUCCESS on success.
++ */
++static void onRtspSrcPadAdded(GstElement* element, GstPad* pad, gpointer udata)
++{
++    STATUS retStatus = STATUS_SUCCESS;
++    PRtspSrcContext pRtspSrcContext = (PRtspSrcContext) udata;
++    PCodecConfiguration pGstConfiguration;
++    PCodecStreamConf pCodecStreamConf = NULL;
++    GstElement* pipeline = NULL;
++    gchar* srcPadName = NULL;
++    GstCaps* srcPadTemplateCaps = NULL;
++    GstCaps* srcPadCurrentCaps = NULL;
++    GstStructure* srcPadStructure = NULL;
++    GstElement* nextElement = NULL;
++    guint curCapsNum = 0;
++    gint payloadType = 0;
++    BOOL video = FALSE;
++    BOOL audio = FALSE;
++    BOOL locked = FALSE;
++    guint i;
++
++    CHK((element != NULL) && (pad != NULL) && (pRtspSrcContext != NULL), STATUS_NULL_ARG);
++
++    pGstConfiguration = &pRtspSrcContext->codecConfiguration;
++    pipeline = (GstElement*) pGstConfiguration->pipeline;
++
++    MUTEX_LOCK(gCodecConfLock);
++    locked = TRUE;
++    srcPadName = app_gst_pad_get_name(pad);
++    srcPadTemplateCaps = app_gst_pad_get_pad_template_caps(pad);
++    DLOGD("a new pad template %s was created", srcPadName);
++
++    srcPadCurrentCaps = app_gst_pad_get_current_caps(pad);
++    curCapsNum = app_gst_caps_get_size(srcPadCurrentCaps);
++
++    for (i = 0; i < curCapsNum; i++) {
++        srcPadStructure = app_gst_caps_get_structure(srcPadCurrentCaps, i);
++        if (app_gst_structure_has_field(srcPadStructure, GST_STRUCT_FIELD_MEDIA) == TRUE) {
++            const gchar* media_value = app_gst_structure_get_string(srcPadStructure, GST_STRUCT_FIELD_MEDIA);
++            DLOGD("media_value:%s", media_value);
++
++            if (STRCMP(media_value, GST_STRUCT_FIELD_MEDIA_VIDEO) == 0) {
++                video = TRUE;
++                pCodecStreamConf = &pGstConfiguration->videoStream;
++            } else if (STRCMP(media_value, GST_STRUCT_FIELD_MEDIA_AUDIO) == 0) {
++                audio = TRUE;
++                pCodecStreamConf = &pGstConfiguration->audioStream;
++            } else {
++                continue;
++            }
++
++            if (app_gst_structure_has_field(srcPadStructure, GST_STRUCT_FIELD_PAYLOAD_TYPE) == TRUE) {
++                app_gst_structure_get_int(srcPadStructure, GST_STRUCT_FIELD_PAYLOAD_TYPE, &payloadType);
++                DLOGD("payload type:%d", payloadType);
++            }
++            if (video == TRUE) {
++                DLOGD("connecting video sink");
++                pCodecStreamConf->payloadType = payloadType;
++                CHK_STATUS((createVideoAppSink(pRtspSrcContext, &nextElement, srcPadName)));
++            } else if (audio == TRUE) {
++                pCodecStreamConf->payloadType = payloadType;
++                DLOGD("connecting audio sink");
++                // CHK_STATUS((createAudioAppSink(pRtspSrcContext, &nextElement, srcPadName)));
++                CHK_STATUS((createDummyAppSink(pRtspSrcContext, &nextElement, srcPadName)));
++            } else {
++                DLOGW("payload type conflicts, and connecting dummy sink");
++                CHK_STATUS((createDummyAppSink(pRtspSrcContext, &nextElement, srcPadName)));
++            }
++        }
++    }
++
++    CHK(nextElement != NULL, STATUS_MEDIA_EMPTY_ELEMENT);
++    CHK(app_gst_element_link_filtered(element, nextElement, srcPadTemplateCaps) == TRUE, STATUS_MEDIA_LINK_ELEMENT);
++    CHK(app_gst_element_set_state(pipeline, GST_STATE_PLAYING) != GST_STATE_CHANGE_FAILURE, STATUS_MEDIA_PLAY);
++
++CleanUp:
++    if (locked) {
++        MUTEX_UNLOCK(gCodecConfLock);
++    }
++    if (srcPadName != NULL) {
++        app_g_free(srcPadName);
++    }
++    if (srcPadCurrentCaps != NULL) {
++        app_gst_caps_unref(srcPadCurrentCaps);
++    }
++    if (srcPadTemplateCaps != NULL) {
++        app_gst_caps_unref(srcPadTemplateCaps);
++    }
++    if (STATUS_FAILED(retStatus)) {
++        DLOGE("operation returned status code: 0x%08x", retStatus);
++        if (nextElement != NULL) {
++            app_gst_object_unref(nextElement);
++        }
++        if (pRtspSrcContext != NULL) {
++            closeGstRtspSrc(pRtspSrcContext);
++            updateCodecStatus(pRtspSrcContext, STATUS_MEDIA_BUS_ERROR);
++        }
++    }
++}
++/**
++ * @brief this callback is invoked when pad is removed.
++ *
++ * @param[in] element the element of this callback.
++ * @param[in] pad the pad of this callback.
++ * @param[in] udata the user data.
++ *
++ * @return STATUS code of the execution. STATUS_SUCCESS on success.
++ */
++static void onRtspSrcPadRemoved(GstElement* element, GstPad* pad, gpointer udata)
++{
++    STATUS retStatus = STATUS_SUCCESS;
++    PRtspSrcContext pRtspSrcContext = (PRtspSrcContext) udata;
++    PCodecConfiguration pGstConfiguration;
++
++    CHK((element != NULL) && (pad != NULL) && (pRtspSrcContext != NULL), STATUS_NULL_ARG);
++    closeGstRtspSrc(pRtspSrcContext);
++    pGstConfiguration = &pRtspSrcContext->codecConfiguration;
++
++CleanUp:
++    if (pRtspSrcContext != NULL) {
++        updateCodecStatus(pRtspSrcContext, STATUS_MEDIA_PAD_REMOVED);
++    }
++    return;
++}
++/**
++ * @brief the initialization of the rtspsrc plugin of GStreamer.
++ *
++ * @param[in] pRtspSrcContext the context of app media.
++ * @param[in] pipeline the pipeline of rtspsrc.
++ * @param[in] enableProbe which mode do you use.
++ *
++ * @return STATUS code of the execution. STATUS_SUCCESS on success.
++ */
++static STATUS initGstRtspSrc(PRtspSrcContext pRtspSrcContext, GstElement* pipeline, BOOL enableProbe)
++{
++    STATUS retStatus = STATUS_SUCCESS;
++    PRtspServerConfiguration pRtspServerConf = NULL;
++    GstElement* rtspSource = NULL;
++    CHAR rtspSourceString[256];
++
++    MUTEX_LOCK(gCodecConfLock);
++    if (pRtspSrcContext->codecConfiguration.preview) {
++        SNPRINTF(rtspSourceString, 255, "rtspPreviewSource%d", pRtspSrcContext->codecConfiguration.id);
++    } else {
++        SNPRINTF(rtspSourceString, 255, "rtspMainSource%d", pRtspSrcContext->codecConfiguration.id);
++    }
++    rtspSource = app_gst_element_factory_make(GST_ELEMENT_FACTORY_NAME_RTSPSRC, rtspSourceString);
++    CHK(rtspSource != NULL, STATUS_MEDIA_MISSING_PLUGIN);
++    // configure rtspsrc
++    pRtspServerConf = &pRtspSrcContext->rtspServerConf;
++
++    app_g_object_set(APP_G_OBJECT(rtspSource), "location", pRtspServerConf->url, "short-header", TRUE, NULL);
++
++    if (pRtspServerConf->username[0] != '\0') {
++        app_g_object_set(APP_G_OBJECT(rtspSource), "user-id", pRtspServerConf->username, NULL);
++    }
++    if (pRtspServerConf->password[0] != '\0') {
++        app_g_object_set(APP_G_OBJECT(rtspSource), "user-pw", pRtspServerConf->password, NULL);
++    }
++
++    app_g_object_set(APP_G_OBJECT(rtspSource), "latency", 200, "drop-on-latency", TRUE, NULL);
++
++    // setup the callbacks.
++    if (enableProbe == FALSE) {
++        DLOGD("initializing rtspsrc");
++        app_g_signal_connect(APP_G_OBJECT(rtspSource), GST_SIGNAL_CALLBACK_PAD_ADDED, G_CALLBACK(onRtspSrcPadAdded), pRtspSrcContext);
++        app_g_signal_connect(APP_G_OBJECT(rtspSource), GST_SIGNAL_CALLBACK_PAD_REMOVED, G_CALLBACK(onRtspSrcPadRemoved), pRtspSrcContext);
++    } else {
++        DLOGD("probing rtspsrc");
++        app_g_signal_connect(APP_G_OBJECT(rtspSource), GST_SIGNAL_CALLBACK_PAD_ADDED, G_CALLBACK(onRtspSrcPadAddedDiscovery), pRtspSrcContext);
++        app_g_signal_connect(APP_G_OBJECT(rtspSource), GST_SIGNAL_CALLBACK_NO_MORE_PADS, G_CALLBACK(onRtspSrcNoMorePadsDiscovery), pRtspSrcContext);
++    }
++
++    app_gst_bin_add_many(APP_GST_BIN(pipeline), rtspSource, NULL);
++
++CleanUp:
++    MUTEX_UNLOCK(gCodecConfLock);
++    return retStatus;
++}
++/**
++ * @brief start discovering the media source, and retrieve the suppported video/audio format.
++ *
++ * @param[in] userData the context of the media.
++ *
++ * @return STATUS code of the execution. STATUS_SUCCESS on success.
++ */
++static PVOID discoverMediaSource(PVOID userData)
++{
++    STATUS retStatus = STATUS_SUCCESS;
++    PRtspSrcContext pRtspSrcContext = (PRtspSrcContext) userData;
++    PCodecConfiguration pGstConfiguration = &pRtspSrcContext->codecConfiguration;
++    GstElement* pipeline = NULL;
++    GstBus* bus = NULL;
++
++    DLOGD("discovering the meida source");
++    pGstConfiguration->codecStatus = STATUS_SUCCESS;
++    CHK((pipeline = app_gst_pipeline_new("kinesis-rtsp-probe")) != NULL, STATUS_NULL_ARG);
++    pGstConfiguration->pipeline = pipeline;
++
++    CHK_STATUS((initGstRtspSrc(pRtspSrcContext, pipeline, FALSE)));
++
++    // Instruct the bus to emit signals for each received message, and connect to the interesting signals
++    CHK((bus = app_gst_element_get_bus(pipeline)) != NULL, STATUS_MEDIA_MISSING_BUS);
++    app_gst_bus_add_signal_watch(bus);
++    app_g_signal_connect(APP_G_OBJECT(bus), GST_SIGNAL_CALLBACK_MSG_ERROR, G_CALLBACK(onMsgErrorFromBus), pRtspSrcContext);
++    app_g_signal_connect(APP_G_OBJECT(bus), GST_SIGNAL_CALLBACK_MSG_EOS, G_CALLBACK(onMsgEosFromBus), pRtspSrcContext);
++
++    // start streaming
++    CHK(app_gst_element_set_state(pipeline, GST_STATE_PLAYING) != GST_STATE_CHANGE_FAILURE, STATUS_MEDIA_PLAY);
++
++    pGstConfiguration->mainLoop = app_g_main_loop_new(NULL, FALSE);
++    // start running the main loop, and it is blocking call.
++    app_g_main_loop_run(pGstConfiguration->mainLoop);
++
++CleanUp:
++
++    /* free resources */
++    DLOGD("release the media source");
++    if (bus != NULL) {
++        app_gst_bus_remove_signal_watch(bus);
++        app_gst_object_unref(bus);
++    }
++    if (pipeline != NULL) {
++        app_gst_element_set_state(pipeline, GST_STATE_NULL);
++        app_gst_object_unref(pipeline);
++        pGstConfiguration->pipeline = NULL;
++    }
++    if (pGstConfiguration->mainLoop != NULL) {
++        app_g_main_loop_unref(pGstConfiguration->mainLoop);
++        pGstConfiguration->mainLoop = NULL;
++    }
++    return (PVOID)(ULONG_PTR) retStatus;
++}
++/**
++ * @brief start discovering the media source, and retrieve the suppported video/audio format.
++ *
++ * @param[in] userData the context of the media.
++ *
++ * @return STATUS code of the execution. STATUS_SUCCESS on success.
++ */
++
++static STATUS latchRtspConfig(PRtspServerConfiguration pRtspServerConf)
++{
++    STATUS retStatus = STATUS_SUCCESS;
++
++    return retStatus;
++}
++
++STATUS initMediaSource(PMediaContext* ppMediaContext, PVOID pUrl)
++{
++    STATUS retStatus = STATUS_SUCCESS;
++    PRtspSrcContext pRtspSrcContext = NULL;
++    PCodecConfiguration pGstConfiguration;
++    PCodecStreamConf pVideoStream;
++    PCodecStreamConf pAudioStream;
++    PRtspServerConfiguration pRtspServerConfiguration = (PRtspServerConfiguration)pUrl;
++
++    CHK(ppMediaContext != NULL, STATUS_NULL_ARG);
++    *ppMediaContext = NULL;
++    CHK(NULL != (pRtspSrcContext = (PRtspSrcContext) MEMCALLOC(1, SIZEOF(RtspSrcContext))), STATUS_MEDIA_NOT_ENOUGH_MEMORY);
++    ATOMIC_STORE_BOOL(&pRtspSrcContext->shutdownRtspSrc, FALSE);
++    ATOMIC_STORE_BOOL(&pRtspSrcContext->codecConfigLatched, FALSE);
++
++    pGstConfiguration = &pRtspSrcContext->codecConfiguration;
++    pGstConfiguration->codecStatus = STATUS_SUCCESS;
++    pGstConfiguration->pipelineStatus = RTSP_PIPELINE_STATUS_NULL;
++    pVideoStream = &pGstConfiguration->videoStream;
++    pAudioStream = &pGstConfiguration->audioStream;
++
++    pVideoStream->codec = RTC_CODEC_H264_PROFILE_42E01F_LEVEL_ASYMMETRY_ALLOWED_PACKETIZATION_MODE;
++    pAudioStream->codec = GST_CODEC_INVALID_VALUE;
++
++    if (!IS_VALID_MUTEX_VALUE(gCodecConfLock)) {
++        gCodecConfLock = MUTEX_CREATE(TRUE);
++        CHK(IS_VALID_MUTEX_VALUE(gCodecConfLock), STATUS_MEDIA_INVALID_MUTEX);
++    }
++
++    if (!IS_VALID_MUTEX_VALUE(gMediaSrcConfLock)) {
++        gMediaSrcConfLock = MUTEX_CREATE(TRUE);
++        CHK(IS_VALID_MUTEX_VALUE(gMediaSrcConfLock), STATUS_MEDIA_INVALID_MUTEX);
++    }
++
++    DLOGD("url: %s, user: %s, password: %s", pRtspServerConfiguration->url, pRtspServerConfiguration->username, 
++        pRtspServerConfiguration->password);
++    MEMCPY(&pRtspSrcContext->rtspServerConf, pRtspServerConfiguration, sizeof(RtspServerConfiguration));
++
++    *ppMediaContext = pRtspSrcContext;
++
++CleanUp:
++
++    if (STATUS_FAILED(retStatus)) {
++        if (pRtspSrcContext != NULL) {
++            detroyMediaSource(pRtspSrcContext);
++        }
++    }
++    return retStatus;
++}
++
++STATUS isMediaSourceReady(PMediaContext pMediaContext)
++{
++    STATUS retStatus = STATUS_SUCCESS;
++    PRtspSrcContext pRtspSrcContext = (PRtspSrcContext) pMediaContext;
++    CHK(pRtspSrcContext != NULL, STATUS_NULL_ARG);
++    if (!ATOMIC_LOAD_BOOL(&pRtspSrcContext->codecConfigLatched)) {
++        discoverMediaSource(pRtspSrcContext);
++    }
++
++    if (ATOMIC_LOAD_BOOL(&pRtspSrcContext->codecConfigLatched)) {
++        retStatus = STATUS_SUCCESS;
++    } else {
++        retStatus = STATUS_MEDIA_NOT_READY;
++    }
++
++CleanUp:
++
++    return retStatus;
++}
++
++STATUS queryMediaVideoCap(PMediaContext pMediaContext, RTC_CODEC* pCodec)
++{
++    STATUS retStatus = STATUS_SUCCESS;
++    PRtspSrcContext pRtspSrcContext = (PRtspSrcContext) pMediaContext;
++    PCodecStreamConf pVideoStream;
++    CHK((pRtspSrcContext != NULL) && (pCodec != NULL), STATUS_NULL_ARG);
++    CHK(ATOMIC_LOAD_BOOL(&pRtspSrcContext->codecConfigLatched), STATUS_MEDIA_NOT_READY);
++    pVideoStream = &pRtspSrcContext->codecConfiguration.videoStream;
++    CHK(pVideoStream->codec != GST_CODEC_INVALID_VALUE, STATUS_MEDIA_NOT_EXISTED);
++    *pCodec = pVideoStream->codec;
++CleanUp:
++    return retStatus;
++}
++
++STATUS queryMediaAudioCap(PMediaContext pMediaContext, RTC_CODEC* pCodec)
++{
++    STATUS retStatus = STATUS_SUCCESS;
++    PRtspSrcContext pRtspSrcContext = (PRtspSrcContext) pMediaContext;
++    PCodecStreamConf pAudioStream;
++    CHK((pRtspSrcContext != NULL), STATUS_NULL_ARG);
++    CHK(ATOMIC_LOAD_BOOL(&pRtspSrcContext->codecConfigLatched), STATUS_MEDIA_NOT_READY);
++    pAudioStream = &pRtspSrcContext->codecConfiguration.audioStream;
++    CHK(pAudioStream->codec != GST_CODEC_INVALID_VALUE, STATUS_MEDIA_NOT_EXISTED);
++    *pCodec = pAudioStream->codec;
++CleanUp:
++    return retStatus;
++}
++
++STATUS linkMeidaSinkHook(PMediaContext pMediaContext, MediaSinkHook mediaSinkHook, PVOID udata)
++{
++    STATUS retStatus = STATUS_SUCCESS;
++    PRtspSrcContext pRtspSrcContext = (PRtspSrcContext) pMediaContext;
++    CHK(pRtspSrcContext != NULL, STATUS_NULL_ARG);
++    pRtspSrcContext->mediaSinkHook = mediaSinkHook;
++    pRtspSrcContext->mediaSinkHookUserdata = udata;
++CleanUp:
++    return retStatus;
++}
++
++STATUS linkMeidaEosHook(PMediaContext pMediaContext, MediaEosHook mediaEosHook, PVOID udata)
++{
++    STATUS retStatus = STATUS_SUCCESS;
++    PRtspSrcContext pRtspSrcContext = (PRtspSrcContext) pMediaContext;
++    CHK(pRtspSrcContext != NULL, STATUS_NULL_ARG);
++    pRtspSrcContext->mediaEosHook = mediaEosHook;
++    pRtspSrcContext->mediaEosHookUserdata = udata;
++CleanUp:
++    return retStatus;
++}
++
++PVOID runMediaSourcePassthru(PVOID args)
++{
++    STATUS retStatus = STATUS_SUCCESS;
++    PRtspSrcContext pRtspSrcContext = (PRtspSrcContext) args;
++    PCodecConfiguration pGstConfiguration = NULL;
++    /* init GStreamer */
++    GstElement* pipeline = NULL;
++    GstBus* bus = NULL;
++    PVOID mainLoop = NULL;
++
++    CHK(pRtspSrcContext != NULL, STATUS_NULL_ARG);
++    pGstConfiguration = &pRtspSrcContext->codecConfiguration;
++    pGstConfiguration->codecStatus = STATUS_SUCCESS;
++    DLOGD("media source is starting");
++    CHK((pipeline = app_gst_pipeline_new(pGstConfiguration->pipelineName)) != NULL, STATUS_MEDIA_MISSING_PIPELINE);
++    pGstConfiguration->pipeline = pipeline;
++    CHK_STATUS((initGstRtspSrc(pRtspSrcContext, pipeline, FALSE)));
++    /* Instruct the bus to emit signals for each received message, and connect to the interesting signals */
++    CHK((bus = app_gst_element_get_bus(pipeline)) != NULL, STATUS_MEDIA_MISSING_BUS);
++    app_gst_bus_add_signal_watch(bus);
++    app_g_signal_connect(APP_G_OBJECT(bus), GST_SIGNAL_CALLBACK_MSG_ERROR, G_CALLBACK(onMsgErrorFromBus), pRtspSrcContext);
++    app_g_signal_connect(APP_G_OBJECT(bus), GST_SIGNAL_CALLBACK_MSG_EOS, G_CALLBACK(onMsgEosFromBus), pRtspSrcContext);
++
++    /* start streaming */
++    CHK(app_gst_element_set_state(pipeline, GST_STATE_PLAYING) != GST_STATE_CHANGE_FAILURE, STATUS_MEDIA_PLAY);
++    pGstConfiguration->pipelineStatus = RTSP_PIPELINE_STATUS_PLAYING;
++    mainLoop = app_g_main_loop_new(NULL, FALSE);
++    pGstConfiguration->mainLoop = mainLoop;
++    // start running the main loop, and it is blocking call.
++    DLOGD("media source is running");
++    app_g_main_loop_run(pGstConfiguration->mainLoop);
++
++CleanUp:
++
++    /* free resources */
++    DLOGD("terminating media source");
++    if (bus != NULL) {
++        app_gst_bus_remove_signal_watch(bus);
++        app_gst_object_unref(bus);
++    }
++    if (pipeline != NULL && pGstConfiguration->pipeline != NULL) {
++        app_gst_element_set_state(pipeline, GST_STATE_NULL);
++        app_gst_object_unref(pipeline);
++        pGstConfiguration->pipeline = NULL;
++    }
++    if (mainLoop != NULL) {
++        app_g_main_loop_unref(pGstConfiguration->mainLoop);
++        pGstConfiguration->mainLoop = NULL;
++    }
++    return (PVOID)(ULONG_PTR) retStatus;
++}
++
++PVOID runMediaSourceTranscoding(PVOID args)
++{
++    STATUS retStatus = STATUS_SUCCESS;
++    PRtspSrcContext pRtspSrcContext = (PRtspSrcContext) args;
++    PCodecConfiguration pGstConfiguration = NULL;
++    /* init GStreamer */
++    GstElement* pipeline = NULL;
++    GstBus* bus = NULL;
++    PVOID mainLoop = NULL;
++    char pipelineBuffer[2049];
++    char elementName[256];
++    char urlName[256];
++    PRtspServerConfiguration pRtspServerConf = &pRtspSrcContext->rtspServerConf;
++    GstElement *videoAppSink = NULL;
++    GError* error = NULL;
++
++    CHK(pRtspSrcContext != NULL, STATUS_NULL_ARG);
++    pGstConfiguration = &pRtspSrcContext->codecConfiguration;
++    pGstConfiguration->codecStatus = STATUS_SUCCESS;
++
++    MUTEX_LOCK(gCodecConfLock);
++    if(pRtspSrcContext->codecConfiguration.preview) {
++        SNPRINTF(elementName, APP_MEDIA_GST_ELEMENT_NAME_MAX_LEN, "videoAppSinkPreview%d", pRtspSrcContext->codecConfiguration.id);
++    } else {
++        SNPRINTF(elementName, APP_MEDIA_GST_ELEMENT_NAME_MAX_LEN, "videoAppSinkMain%d", pRtspSrcContext->codecConfiguration.id);
++    }
++    DLOGD("%s", elementName);
++
++    if(pRtspSrcContext->codecConfiguration.preview) {
++        SNPRINTF(elementName, APP_MEDIA_GST_ELEMENT_NAME_MAX_LEN, "videoAppSinkPreview%d", pRtspSrcContext->codecConfiguration.id);
++    } else {
++        SNPRINTF(elementName, APP_MEDIA_GST_ELEMENT_NAME_MAX_LEN, "videoAppSinkMain%d", pRtspSrcContext->codecConfiguration.id);
++    }
++
++    STRCPY(urlName, pRtspServerConf->url);
++    if (pRtspServerConf->username[0] != '\0') {
++        SNPRINTF(urlName, APP_MEDIA_GST_ELEMENT_NAME_MAX_LEN, "rtsp://%s:%s@%s", pRtspServerConf->username, 
++                pRtspServerConf->password, &pRtspServerConf->url[7]);
++    }
++    DLOGD("url: %s", urlName);
++
++    if (pRtspSrcContext->codecConfiguration.transcoding == 1) {
++        SNPRINTF(pipelineBuffer, 2048,
++            "rtspsrc location=%s latency=200 drop-on-latency=true ! queue ! decodebin ! " 
++            " queue max-size-time=0 ! videoconvert ! "
++            "x264enc bframes=0 speed-preset=veryfast bitrate=1024 byte-stream=TRUE tune=zerolatency key-int-max=25 ! "
++            "video/x-h264,stream-format=byte-stream,alignment=au,profile=baseline ! "
++            "appsink sync=TRUE emit-signals=TRUE name=%s", urlName, elementName);
++    } else if (pRtspSrcContext->codecConfiguration.transcoding == 2) {
++        
++        SNPRINTF(pipelineBuffer, 2048, "rtspsrc latency=200 drop-on-latency=true location=%s name=src short-header=TRUE ! "
++                                "rtph264depay ! video/x-h264,stream-format=byte-stream,alignment=au ! "
++                                "appsink sync=TRUE emit-signals=TRUE name=%s", urlName, elementName);
++    }
++
++    DLOGD("%s", pipelineBuffer);
++    pipeline = gst_parse_launch(pipelineBuffer, &error);
++    if (pipeline == NULL) {
++        MUTEX_UNLOCK(gCodecConfLock);
++        goto CleanUp;
++    }
++    pRtspSrcContext->codecConfiguration.pipeline = pipeline;
++
++    videoAppSink = gst_bin_get_by_name(GST_BIN(pipeline), elementName);
++    if (videoAppSink == NULL) {
++        DLOGE("Get videoAppSink error");
++        MUTEX_UNLOCK(gCodecConfLock);
++        goto CleanUp;
++    }
++    app_g_object_set(APP_G_OBJECT(videoAppSink), "emit-signals", TRUE, "sync", FALSE, NULL);
++    app_g_signal_connect(videoAppSink, GST_SIGNAL_CALLBACK_NEW_SAMPLE, G_CALLBACK(onNewSampleFromVideoAppSink), pRtspSrcContext);
++    gst_element_set_state(pipeline, GST_STATE_PLAYING);
++    pGstConfiguration->pipelineStatus = RTSP_PIPELINE_STATUS_PLAYING;
++    MUTEX_UNLOCK(gCodecConfLock);
++    mainLoop = app_g_main_loop_new(NULL, FALSE);
++    pGstConfiguration->mainLoop = mainLoop;
++    // start running the main loop, and it is blocking call.
++    DLOGD("media source is running");
++    app_g_main_loop_run(pGstConfiguration->mainLoop);
++
++CleanUp:
++
++    /* free resources */
++    DLOGD("terminating media source");
++    if (bus != NULL) {
++        app_gst_bus_remove_signal_watch(bus);
++        app_gst_object_unref(bus);
++    }
++    if (pipeline != NULL && pGstConfiguration->pipeline != NULL) {
++        app_gst_element_set_state(pipeline, GST_STATE_NULL);
++        app_gst_object_unref(pipeline);
++        pGstConfiguration->pipeline = NULL;
++    }
++    if (mainLoop != NULL) {
++        app_g_main_loop_unref(pGstConfiguration->mainLoop);
++        pGstConfiguration->mainLoop = NULL;
++    }
++    return (PVOID)(ULONG_PTR) retStatus;
++}
++
++
++
++PVOID runMediaSource(PVOID args)
++{
++    STATUS retStatus = STATUS_SUCCESS;
++    PRtspSrcContext pRtspSrcContext = (PRtspSrcContext) args;
++    PCodecConfiguration pGstConfiguration = NULL;
++    /* init GStreamer */
++    GstElement* pipeline = NULL;
++    GstBus* bus = NULL;
++    PVOID mainLoop = NULL;
++
++    if (pRtspSrcContext == NULL) {
++        retStatus = STATUS_NULL_ARG;
++        return (PVOID)(ULONG_PTR) retStatus;
++    }
++    pGstConfiguration = &pRtspSrcContext->codecConfiguration;
++    pGstConfiguration->codecStatus = STATUS_SUCCESS;
++    if (pGstConfiguration->transcoding == 0) {
++       runMediaSourcePassthru(pRtspSrcContext);
++    } else {
++        runMediaSourceTranscoding(pRtspSrcContext);
++    }
++    return (PVOID)(ULONG_PTR) retStatus;
++}
++
++STATUS shutdownMediaSource(PMediaContext pMediaContext)
++{
++    STATUS retStatus = STATUS_SUCCESS;
++    PRtspSrcContext pRtspSrcContext = (PRtspSrcContext) pMediaContext;
++    CHK(pRtspSrcContext != NULL, STATUS_NULL_ARG);
++    closeGstRtspSrc(pRtspSrcContext);
++    ATOMIC_STORE_BOOL(&pRtspSrcContext->shutdownRtspSrc, TRUE);
++
++CleanUp:
++    return retStatus;
++}
++
++STATUS detroyMediaSource(PMediaContext pMediaContext)
++{
++    STATUS retStatus = STATUS_SUCCESS;
++    PRtspSrcContext pRtspSrcContext = (PRtspSrcContext) pMediaContext;
++
++    CHK(pMediaContext != NULL, STATUS_NULL_ARG);
++    MEMFREE(pRtspSrcContext);
++
++    if (IS_VALID_MUTEX_VALUE(gCodecConfLock)) {
++        MUTEX_FREE(gCodecConfLock);
++    }
++
++CleanUp:
++    return retStatus;
++}
+diff --git a/samples/kvsRtspSrc.h b/samples/kvsRtspSrc.h
+new file mode 100644
+index 000000000..7f4d594c9
+--- /dev/null
++++ b/samples/kvsRtspSrc.h
+@@ -0,0 +1,185 @@
++/*
++ * Copyright 2021 Amazon.com, Inc. or its affiliates. All Rights Reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License").
++ * You may not use this file except in compliance with the License.
++ * A copy of the License is located at
++ *
++ *  http://aws.amazon.com/apache2.0
++ *
++ * or in the "license" file accompanying this file. This file is distributed
++ * on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either
++ * express or implied. See the License for the specific language governing
++ * permissions and limitations under the License.
++ */
++#ifndef __KINESIS_VIDEO_WEBRTC_APP_RTSP_SRC_INCLUDE__
++#define __KINESIS_VIDEO_WEBRTC_APP_RTSP_SRC_INCLUDE__
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#include <com/amazonaws/kinesis/video/webrtcclient/Include.h>
++#include <gst/gst.h>
++
++#define GST_ELEMENT_FACTORY_NAME_RTSPSRC        "rtspsrc"
++#define GST_ELEMENT_FACTORY_NAME_QUEUE          "queue"
++#define GST_ELEMENT_FACTORY_NAME_RTP_DEPAY_H264 "rtph264depay"
++#define GST_ELEMENT_FACTORY_NAME_RTP_DEPAY_VP8  "rtpvp8depay"
++#define GST_ELEMENT_FACTORY_NAME_RTP_DEPAY_OPUS "rtpopusdepay"
++#define GST_ELEMENT_FACTORY_NAME_RTP_DEPAY_PCMU "rtppcmudepay"
++#define GST_ELEMENT_FACTORY_NAME_RTP_DEPAY_PCMA "rtppcmadepay"
++#define GST_ELEMENT_FACTORY_NAME_CAPS_FILTER    "capsfilter"
++#define GST_ELEMENT_FACTORY_NAME_APP_SINK       "appsink"
++#define GST_ELEMENT_FACTORY_NAME_FAKE_SINK      "fakesink"
++
++#define GST_SIGNAL_CALLBACK_NEW_SAMPLE   "new-sample"
++#define GST_SIGNAL_CALLBACK_PAD_ADDED    "pad-added"
++#define GST_SIGNAL_CALLBACK_PAD_REMOVED  "pad-removed"
++#define GST_SIGNAL_CALLBACK_NO_MORE_PADS "no-more-pads"
++#define GST_SIGNAL_CALLBACK_MSG_ERROR    "message::error"
++#define GST_SIGNAL_CALLBACK_MSG_EOS      "message::eos"
++
++#define GST_STRUCT_FIELD_MEDIA         "media"
++#define GST_STRUCT_FIELD_MEDIA_VIDEO   "video"
++#define GST_STRUCT_FIELD_MEDIA_AUDIO   "audio"
++#define GST_STRUCT_FIELD_ENCODING      "encoding-name"
++#define GST_STRUCT_FIELD_PKT_MODE      "packetization-mode"
++#define GST_STRUCT_FIELD_PROFILE_LV_ID "profile-level-id"
++#define GST_STRUCT_FIELD_ENCODING_H264 "H264"
++#define GST_STRUCT_FIELD_ENCODING_VP8  "VP8"
++#define GST_STRUCT_FIELD_ENCODING_PCMU "PCMU"
++#define GST_STRUCT_FIELD_ENCODING_PCMA "PCMA"
++#define GST_STRUCT_FIELD_ENCODING_OPUS "opus"
++#define GST_STRUCT_FIELD_PAYLOAD_TYPE  "payload"
++#define GST_STRUCT_FIELD_CLOCK_RATE    "clock-rate"
++
++#define GST_CODEC_INVALID_VALUE   0xF
++#define GST_ENCODING_NAME_MAX_LEN 256
++#define GST_PIPELINE_NAME_MAX_NAME 256
++
++#define RTSP_PIPELINE_STATUS_NULL 0
++#define RTSP_PIPELINE_STATUS_PLAYING 1
++#define RTSP_PIPELINE_STATUS_PAUSED 2
++
++typedef STATUS (*MediaSinkHook)(PVOID udata, PFrame pFrame);
++typedef STATUS (*MediaEosHook)(PVOID udata);
++typedef PVOID PMediaContext;
++
++typedef struct {
++    RTC_CODEC codec;
++    CHAR encodingName[GST_ENCODING_NAME_MAX_LEN];
++    UINT32 payloadType;
++    UINT32 clockRate;
++} CodecStreamConf, *PCodecStreamConf;
++
++typedef struct {
++    STATUS codecStatus;
++    PVOID mainLoop;       //!< the main runner for gstreamer.
++    GstElement* pipeline; //!< the pipeline for the rtsp url.
++    CodecStreamConf videoStream;
++    CodecStreamConf audioStream;
++    CHAR pipelineName[GST_PIPELINE_NAME_MAX_NAME];
++    UINT32 pipelineStatus;
++    BOOL preview;
++    UINT32 transcoding;
++    UINT32 id;
++} CodecConfiguration, *PCodecConfiguration;
++
++typedef struct {
++    CHAR url[MAX_URI_CHAR_LEN];                 //!< the rtsp url.
++    CHAR username[APP_MEDIA_RTSP_USERNAME_LEN]; //!< the username to login the rtsp url.
++    CHAR password[APP_MEDIA_RTSP_PASSWORD_LEN]; //!< the password to login the rtsp url.
++} RtspServerConfiguration, *PRtspServerConfiguration;
++
++typedef struct {
++    MUTEX codecConfLock;
++    RtspServerConfiguration rtspServerConf; //!< the configuration of rtsp camera.
++    CodecConfiguration codecConfiguration;  //!< the configuration of gstreamer.
++    // the codec.
++    volatile ATOMIC_BOOL shutdownRtspSrc;
++    volatile ATOMIC_BOOL codecConfigLatched;
++    // for meida output.
++    PVOID mediaSinkHookUserdata;
++    MediaSinkHook mediaSinkHook;
++    PVOID mediaEosHookUserdata;
++    MediaEosHook mediaEosHook;
++} RtspSrcContext, *PRtspSrcContext;
++
++/**
++ * @brief   initialize the context of media.
++ * @param[in, out] ppMediaContext create the context of the media source, initialize it and return it.
++ *
++ * @return STATUS code of the execution. STATUS_SUCCESS on success.
++ */
++STATUS initMediaSource(PMediaContext* ppMediaContext, PVOID url);
++/**
++ * @brief   polling the status of media source.
++ * @param[in] pMediaContext the context of the media source.
++ *
++ * @return STATUS code of the execution. STATUS_SUCCESS on success.
++ */
++STATUS isMediaSourceReady(PMediaContext pMediaContext);
++/**
++ * @brief   query the video capability of media.
++ * @param[in] pMediaContext the context of the media source.
++ * @param[in, out] pCodec the codec of the media source.
++ *
++ * @return STATUS code of the execution. STATUS_SUCCESS on success.
++ */
++STATUS queryMediaVideoCap(PMediaContext pMediaContext, RTC_CODEC* pCodec);
++/**
++ * @brief   query the audio capability of media.
++ * @param[in] pMediaContext the context of the media source.
++ * @param[in, out] pCodec the codec of the media source.
++ *
++ * @return STATUS code of the execution. STATUS_SUCCESS on success.
++ */
++STATUS queryMediaAudioCap(PMediaContext pMediaContext, RTC_CODEC* pCodec);
++/**
++ * @brief   link the hook function with the media sink.
++ *
++ *          YOU MUST BE AWARE OF RETURNING ERROR IN THE HOOK CAUSES STREAM TERMINATED.
++ *
++ * @param[in] pMediaContext the context of the media source.
++ * @param[in] mediaSinkHook the function pointer for the hook of media sink.
++ * @param[in] udata the user data for the hook.
++ *
++ * @return STATUS code of the execution. STATUS_SUCCESS on success.
++ */
++STATUS linkMeidaSinkHook(PMediaContext pMediaContext, MediaSinkHook mediaSinkHook, PVOID udata);
++/**
++ * @brief   link the eos hook function with the media source.
++ * @param[in] pMediaContext the context of the media source.
++ * @param[in] mediaSinkHook the function pointer for the eos hook of media source.
++ * @param[in] udata the user data for the hook.
++ *
++ * @return STATUS code of the execution. STATUS_SUCCESS on success.
++ */
++STATUS linkMeidaEosHook(PMediaContext pMediaContext, MediaEosHook mediaEosHook, PVOID udata);
++/**
++ * @brief   the main thread of media source.
++ * @param[in] args the context of the media source.
++ *
++ * @return STATUS code of the execution. STATUS_SUCCESS on success.
++ */
++PVOID runMediaSource(PVOID args);
++/**
++ * @brief   shutdown the media source and the main thread will be terminated as well.
++ * @param[in] pMediaContext the context of the media source.
++ *
++ * @return STATUS code of the execution. STATUS_SUCCESS on success.
++ */
++STATUS shutdownMediaSource(PMediaContext pMediaContext);
++/**
++ * @brief   destroy the context of media source.
++ * @param[in] PMediaContext the context of the media source.
++ *
++ * @return STATUS code of the execution. STATUS_SUCCESS on success.
++ */
++STATUS detroyMediaSource(PMediaContext pMediaContext);
++
++#ifdef __cplusplus
++}
++#endif
++#endif /* __KINESIS_VIDEO_WEBRTC_APP_RTSP_SRC_INCLUDE__ */
+diff --git a/samples/kvsRtspSrcWrap.h b/samples/kvsRtspSrcWrap.h
+new file mode 100644
+index 000000000..13d2402a0
+--- /dev/null
++++ b/samples/kvsRtspSrcWrap.h
+@@ -0,0 +1,130 @@
++/*
++ * Copyright 2021 Amazon.com, Inc. or its affiliates. All Rights Reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License").
++ * You may not use this file except in compliance with the License.
++ * A copy of the License is located at
++ *
++ *  http://aws.amazon.com/apache2.0
++ *
++ * or in the "license" file accompanying this file. This file is distributed
++ * on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either
++ * express or implied. See the License for the specific language governing
++ * permissions and limitations under the License.
++ */
++#ifndef __KINESIS_VIDEO_WEBRTC_APP_RTSP_SRC_WRAP_INCLUDE__
++#define __KINESIS_VIDEO_WEBRTC_APP_RTSP_SRC_WRAP_INCLUDE__
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++#include <com/amazonaws/kinesis/video/webrtcclient/Include.h>
++
++#include <gst/gst.h>
++#include <gst/app/gstappsink.h>
++#include <gst/gststructure.h>
++#include <gst/gstcaps.h>
++#include <gst/rtsp/rtsp.h>
++
++#if !defined(APP_RTSP_SRC_WRAP)
++#define APP_G_OBJECT                   G_OBJECT
++#define app_g_object_set               g_object_set
++#define app_g_signal_connect           g_signal_connect
++#define app_g_free                     g_free
++#define app_g_error_free               g_error_free
++#define app_g_main_loop_new            g_main_loop_new
++#define app_g_main_loop_run            g_main_loop_run
++#define app_g_main_loop_unref          g_main_loop_unref
++#define app_g_main_loop_quit           g_main_loop_quit
++#define app_g_type_check_instance_cast g_type_check_instance_cast
++
++#define APP_GST_APP_SINK                  GST_APP_SINK
++#define APP_GST_BIN                       GST_BIN
++#define app_gst_init                      gst_init
++#define app_gst_app_sink_pull_sample      gst_app_sink_pull_sample
++#define app_gst_sample_get_buffer         gst_sample_get_buffer
++#define app_gst_sample_get_segment        gst_sample_get_segment
++#define app_gst_sample_unref              gst_sample_unref
++#define app_gst_segment_to_running_time   gst_segment_to_running_time
++#define app_gst_buffer_map                gst_buffer_map
++#define app_gst_buffer_unmap              gst_buffer_unmap
++#define app_gst_element_factory_make      gst_element_factory_make
++#define app_gst_caps_unref                gst_caps_unref
++#define app_gst_caps_new_simple           gst_caps_new_simple
++#define app_gst_caps_get_size             gst_caps_get_size
++#define app_gst_caps_get_structure        gst_caps_get_structure
++#define app_gst_bin_add_many              gst_bin_add_many
++#define app_gst_element_link_many         gst_element_link_many
++#define app_gst_element_link_filtered     gst_element_link_filtered
++#define app_gst_object_unref              gst_object_unref
++#define app_gst_pad_get_name              gst_pad_get_name
++#define app_gst_object_get_name           gst_object_get_name
++#define app_gst_pad_get_pad_template_caps gst_pad_get_pad_template_caps
++#define app_gst_pad_get_current_caps      gst_pad_get_current_caps
++#define app_gst_structure_has_field       gst_structure_has_field
++#define app_gst_structure_get_string      gst_structure_get_string
++#define app_gst_structure_get_int         gst_structure_get_int
++#define app_gst_element_set_state         gst_element_set_state
++#define app_gst_message_parse_error       gst_message_parse_error
++#define app_gst_pipeline_new              gst_pipeline_new
++#define app_gst_element_get_bus           gst_element_get_bus
++#define app_gst_bus_add_signal_watch      gst_bus_add_signal_watch
++#define app_gst_bus_remove_signal_watch   gst_bus_remove_signal_watch
++#define app_gst_app_sink_get_type         gst_app_sink_get_type
++#define app_gst_bin_get_type              gst_bin_get_type
++#else //!< !defined(APP_RTSP_SRC_WRAP)
++void app_g_object_set(gpointer object, const gchar* first_property_name, ...);
++gulong app_g_signal_connect(gpointer instance, const gchar* detailed_signal, GCallback c_handler, gpointer data);
++void app_g_free(gpointer mem);
++void app_g_error_free(GError** err);
++PVOID app_g_main_loop_new(PVOID context, gboolean is_running);
++void app_g_main_loop_run(PVOID loop);
++void app_g_main_loop_unref(PVOID loop);
++void app_g_main_loop_quit(PVOID loop);
++GTypeInstance* app_g_type_check_instance_cast(GTypeInstance* instance, GType iface_type);
++void app_gst_init(int* argc, char** argv[]);
++PVOID app_gst_app_sink_pull_sample(GstAppSink* appsink);
++GstBuffer* app_gst_sample_get_buffer(PVOID sample);
++GstSegment* app_gst_sample_get_segment(PVOID sample);
++void app_gst_sample_unref(PVOID sample);
++guint64 app_gst_segment_to_running_time(const GstSegment* segment, GstFormat format, guint64 position);
++gboolean app_gst_buffer_map(GstBuffer* buffer, GstMapInfo* info, GstMapFlags flags);
++void app_gst_buffer_unmap(GstBuffer* buffer, GstMapInfo* info);
++GstElement* app_gst_element_factory_make(const gchar* factoryname, const gchar* name);
++void app_gst_caps_unref(GstCaps* caps);
++GstCaps* app_gst_caps_new_simple(const char* media_type, const char* fieldname, ...);
++guint app_gst_caps_get_size(const GstCaps* caps);
++GstStructure* app_gst_caps_get_structure(const GstCaps* caps, guint index);
++void app_gst_bin_add_many(GstBin* bin, GstElement* element_1, ...);
++gboolean app_gst_element_link_many(GstElement* element_1, GstElement* element_2, ...);
++gboolean app_gst_element_link_filtered(GstElement* src, GstElement* dest, GstCaps* filter);
++void app_gst_object_unref(gpointer object);
++gchar* app_gst_pad_get_name(GstPad* pad);
++gchar* app_gst_object_get_name(GstObject* object);
++GstCaps* app_gst_pad_get_pad_template_caps(GstPad* pad);
++GstCaps* app_gst_pad_get_current_caps(GstPad* pad);
++gboolean app_gst_structure_has_field(const GstStructure* structure, const gchar* fieldname);
++gchar* app_gst_structure_get_string(const GstStructure* structure, const gchar* fieldname);
++gboolean app_gst_structure_get_int(const GstStructure* structure, const gchar* fieldname, gint* value);
++GstStateChangeReturn app_gst_element_set_state(GstElement* element, GstState state);
++void app_gst_message_parse_error(GstMessage* message, GError** gerror, gchar** debug);
++GstElement* app_gst_pipeline_new(const gchar* name);
++GstBus* app_gst_element_get_bus(GstElement* element);
++void app_gst_bus_add_signal_watch(GstBus* bus);
++void app_gst_bus_remove_signal_watch(GstBus* bus);
++GType app_gst_app_sink_get_type(void);
++GType app_gst_bin_get_type(void);
++
++#define APP_G_TYPE_CIC(ip, gt, ct)                               ((ct*) app_g_type_check_instance_cast((GTypeInstance*) ip, gt))
++#define APP_G_TYPE_CHECK_INSTANCE_CAST(instance, g_type, c_type) (APP_G_TYPE_CIC((instance), (g_type), c_type))
++#define APP_G_OBJECT(object)                                     (APP_G_TYPE_CHECK_INSTANCE_CAST((object), G_TYPE_OBJECT, GObject))
++#define APP_GST_TYPE_APP_SINK                                    (app_gst_app_sink_get_type())
++#define APP_GST_APP_SINK(obj)                                    (APP_G_TYPE_CHECK_INSTANCE_CAST((obj), APP_GST_TYPE_APP_SINK, GstAppSink))
++#define APP_GST_TYPE_BIN                                         (app_gst_bin_get_type())
++#define APP_GST_BIN(obj)                                         (APP_G_TYPE_CHECK_INSTANCE_CAST((obj), APP_GST_TYPE_BIN, GstBin))
++#endif //!< !defined(APP_RTSP_SRC_WRAP)
++
++#ifdef __cplusplus
++}
++#endif
++#endif /* __KINESIS_VIDEO_WEBRTC_APP_RTSP_SRC_WRAP_INCLUDE__ */
+diff --git a/samples/kvsWebRTCClientMaster.c b/samples/kvsWebRTCClientMaster.c
+index a8a4348ec..7b839a852 100644
+--- a/samples/kvsWebRTCClientMaster.c
++++ b/samples/kvsWebRTCClientMaster.c
+@@ -2,8 +2,80 @@
+ 
+ extern PSampleConfiguration gSampleConfiguration;
+ 
++#define MAX_MAIN_PREVIEW_MODE_MESSAGE_LEN 256
++const char RTP_MIX[] = "webrtc_rtp_mix";
++const char CAM_ID[] = "maincam_id";
++
+ // #define VERBOSE
+ 
++UINT32 parseDataMessage(char *message, char *parm)
++{
++    UINT32 i, j;
++    UINT32 len = STRLEN(message);
++    char *p;
++    UINT32 parmData;
++    char buf[64];
++
++    i = 0;
++    j = 0;
++    p = &message[j];
++    do {
++        parm[i] = p[i];
++        if (parm[i] == ':') {
++            parm[i] = 0;
++            break;
++        }
++        i++;
++        j++;
++    } while (j < len);
++
++    p = &message[++j];
++    strcpy(buf, p);
++
++    return(atoi(buf));
++}
++
++VOID processDataMessageString(PVOID args, PBYTE pMessage, UINT32 pMessageLen)
++{
++    PSampleStreamingSession pSampleStreamingSession = (PSampleStreamingSession) args;
++    char buf[MAX_MAIN_PREVIEW_MODE_MESSAGE_LEN];
++    char parm[2][MAX_MAIN_PREVIEW_MODE_MESSAGE_LEN];
++    UINT32 parmData[2];
++    char *p;
++
++    UINT32 i, j, len;
++    int k;
++
++    DLOGI("DataChannel String Message: %.*s\n", pMessageLen, pMessage);
++
++    p = pMessage;
++    j = 0;
++    k = 0;
++    for (i=0;i<pMessageLen;i++) {
++        buf[k] = p[i];
++        if (buf[k] == 0x3b || buf[k] == 0xa || buf[k] == 0) {
++            buf[k] = '\0';
++            parmData[j] = parseDataMessage(buf, parm[j]);
++            DLOGI("parm: %s, data=%d", parm[j], parmData[j]);
++            j++;
++            len = i + 1;
++            k = -1;
++        }
++        k++;
++    }
++    if (!strcmp(RTP_MIX, parm[0])) {
++        if (!strcmp(CAM_ID, parm[1])) {
++            pSampleStreamingSession->sendMultiChannelPreview = parmData[0];
++            if (pSampleStreamingSession->sendMultiChannelPreview == 0) {
++                pSampleStreamingSession->mainChannelId = parmData[1];
++            }
++            DLOGI("sendMultiChannelPreview=%d, mainChannelId=%d", pSampleStreamingSession->sendMultiChannelPreview,
++                    pSampleStreamingSession->mainChannelId);
++        }
++    }
++}
++
++
+ INT32 main(INT32 argc, CHAR* argv[])
+ {
+     STATUS retStatus = STATUS_SUCCESS;
+@@ -45,6 +117,12 @@ INT32 main(INT32 argc, CHAR* argv[])
+         }
+     }
+ 
++    pSampleConfiguration->numOfCameras = 8;
++    if (argc > 2) {
++        pSampleConfiguration->numOfCameras = atoi(argv[2]);
++    }
++    printf("[KVS Master] Camera supported: %d\n", pSampleConfiguration->numOfCameras);
++
+     // Set the audio and video handlers
+     pSampleConfiguration->audioSource = sendAudioPackets;
+     pSampleConfiguration->videoSource = sendVideoPackets;
+@@ -53,22 +131,6 @@ INT32 main(INT32 argc, CHAR* argv[])
+     pSampleConfiguration->mediaType = SAMPLE_STREAMING_AUDIO_VIDEO;
+     printf("[KVS Master] Finished setting audio and video handlers\n");
+ 
+-    // Check if the samples are present
+-
+-    retStatus = readFrameFromDisk(NULL, &frameSize, "./h264SampleFrames/frame-0001.h264");
+-    if (retStatus != STATUS_SUCCESS) {
+-        printf("[KVS Master] readFrameFromDisk(): operation returned status code: 0x%08x \n", retStatus);
+-        goto CleanUp;
+-    }
+-    printf("[KVS Master] Checked sample video frame availability....available\n");
+-
+-    retStatus = readFrameFromDisk(NULL, &frameSize, "./opusSampleFrames/sample-001.opus");
+-    if (retStatus != STATUS_SUCCESS) {
+-        printf("[KVS Master] readFrameFromDisk(): operation returned status code: 0x%08x \n", retStatus);
+-        goto CleanUp;
+-    }
+-    printf("[KVS Master] Checked sample audio frame availability....available\n");
+-
+     // Initialize KVS WebRTC. This must be done before anything else, and must only be done once.
+     retStatus = initKvsWebRtc();
+     if (retStatus != STATUS_SUCCESS) {
+@@ -205,6 +267,8 @@ CleanUp:
+     return retStatus;
+ }
+ 
++
++
+ PVOID sendVideoPackets(PVOID args)
+ {
+     STATUS retStatus = STATUS_SUCCESS;
+@@ -214,9 +278,12 @@ PVOID sendVideoPackets(PVOID args)
+     UINT32 fileIndex = 0, frameSize;
+     CHAR filePath[MAX_PATH_LEN + 1];
+     STATUS status;
+-    UINT32 i;
++    UINT32 i, j, streamId;
+     UINT64 startTime, lastFrameTime, elapsed;
+     MEMSET(&encoderStats, 0x00, SIZEOF(RtcEncoderStats));
++    UINT32 count = 30;
++    PSampleStreamingSession pSampleStreamingSession = NULL;
++    static UINT32 lastFrameType = 0;
+ 
+     if (pSampleConfiguration == NULL) {
+         printf("[KVS Master] sendVideoPackets(): operation returned status code: 0x%08x \n", STATUS_NULL_ARG);
+@@ -224,68 +291,106 @@ PVOID sendVideoPackets(PVOID args)
+     }
+ 
+     frame.presentationTs = 0;
+-    startTime = GETTIME();
+-    lastFrameTime = startTime;
++    frame.duration = 0;
++    frame.version = FRAME_CURRENT_VERSION;
+ 
+     while (!ATOMIC_LOAD_BOOL(&pSampleConfiguration->appTerminateFlag)) {
++        startTime = GETTIME();
+         fileIndex = fileIndex % NUMBER_OF_H264_FRAME_FILES + 1;
+-        snprintf(filePath, MAX_PATH_LEN, "./h264SampleFrames/frame-%04d.h264", fileIndex);
+-
+-        retStatus = readFrameFromDisk(NULL, &frameSize, filePath);
+-        if (retStatus != STATUS_SUCCESS) {
+-            printf("[KVS Master] readFrameFromDisk(): operation returned status code: 0x%08x \n", retStatus);
+-            goto CleanUp;
+-        }
+-
+-        // Re-alloc if needed
+-        if (frameSize > pSampleConfiguration->videoBufferSize) {
+-            pSampleConfiguration->pVideoFrameBuffer = (PBYTE) MEMREALLOC(pSampleConfiguration->pVideoFrameBuffer, frameSize);
+-            if (pSampleConfiguration->pVideoFrameBuffer == NULL) {
+-                printf("[KVS Master] Video frame Buffer reallocation failed...%s (code %d)\n", strerror(errno), errno);
+-                printf("[KVS Master] MEMREALLOC(): operation returned status code: 0x%08x \n", STATUS_NOT_ENOUGH_MEMORY);
+-                goto CleanUp;
+-            }
+-
+-            pSampleConfiguration->videoBufferSize = frameSize;
+-        }
+-
+-        frame.frameData = pSampleConfiguration->pVideoFrameBuffer;
+-        frame.size = frameSize;
+-
+-        retStatus = readFrameFromDisk(frame.frameData, &frameSize, filePath);
+-        if (retStatus != STATUS_SUCCESS) {
+-            printf("[KVS Master] readFrameFromDisk(): operation returned status code: 0x%08x \n", retStatus);
+-            goto CleanUp;
+-        }
+-
+-        // based on bitrate of samples/h264SampleFrames/frame-*
+-        encoderStats.width = 640;
+-        encoderStats.height = 480;
+-        encoderStats.targetBitrate = 262000;
+-        frame.presentationTs += SAMPLE_VIDEO_FRAME_DURATION;
+-
+         MUTEX_LOCK(pSampleConfiguration->streamingSessionListReadLock);
+         for (i = 0; i < pSampleConfiguration->streamingSessionCount; ++i) {
+-            status = writeFrame(pSampleConfiguration->sampleStreamingSessionList[i]->pVideoRtcRtpTransceiver, &frame);
+-            encoderStats.encodeTimeMsec = 4; // update encode time to an arbitrary number to demonstrate stats update
+-            updateEncoderStats(pSampleConfiguration->sampleStreamingSessionList[i]->pVideoRtcRtpTransceiver, &encoderStats);
+-            if (status != STATUS_SRTP_NOT_READY_YET) {
++            pSampleStreamingSession = pSampleConfiguration->sampleStreamingSessionList[i];
++            if (pSampleStreamingSession->sendMultiChannelPreview == 1) {
++                count++;
++                if (count > 30) {
++                    DLOGI("Sending %d channel preview ...", pSampleConfiguration->numOfCameras);
++                    count = 0;
++                }
++                for (j = 0; j < pSampleConfiguration->numOfCameras; j++) {
++                    if (lastFrameType == 1) {
++                        fileIndex = 1;
++                    }
++                    lastFrameType = 0;
++                    SNPRINTF(filePath, MAX_PATH_LEN, "./h264SampleFrames/preview/cam%d/frame-%04d.h264", j%8, fileIndex);
++                    DLOGV("j=%d %s", j, filePath);
++                    status = readFrameFromDisk(NULL, &frameSize, filePath);
++                    if (status != STATUS_SUCCESS) {
++                        continue;
++                    }
++                    // Re-alloc if needed
++                    if (frameSize > pSampleConfiguration->videoBufferSize) {
++                        pSampleConfiguration->pVideoFrameBuffer = (PBYTE) MEMREALLOC(pSampleConfiguration->pVideoFrameBuffer, frameSize);
++                        CHK_ERR(pSampleConfiguration->pVideoFrameBuffer != NULL, STATUS_NOT_ENOUGH_MEMORY, "[KVS Master] Failed to allocate video frame buffer");
++                        pSampleConfiguration->videoBufferSize = frameSize;
++                    }
++                    frame.size = frameSize;
++                    frame.frameData = pSampleConfiguration->pVideoFrameBuffer;
++                    status = readFrameFromDisk(frame.frameData, &frameSize, filePath);
++                    if (status != STATUS_SUCCESS) {
++                        continue;
++                    }
++                    frame.presentationTs = pSampleStreamingSession->videoTimestamp;
++                    frame.decodingTs = frame.presentationTs;
++                    if (j == 0) {
++                        pSampleStreamingSession->videoTimestamp += SAMPLE_VIDEO_FRAME_DURATION;
++                    }
++                    status = writeFrame(pSampleConfiguration->sampleStreamingSessionList[i]->pVideoRtcRtpTransceiver, &frame, j);
++                    if (status != STATUS_SRTP_NOT_READY_YET) {
++                        if (status != STATUS_SUCCESS) {
++                            DLOGE("writeFrame() failed with 0x%08x", status);
++                        }
++                    }
++                }
++            } else {
++                count ++;
++                if (count > 30) {
++                    DLOGD("Sending main stream: %d", pSampleStreamingSession->mainChannelId);
++                }
++                if (lastFrameType == 0) {
++                    fileIndex = 1;
++                }
++                lastFrameType = 1;
++
++                streamId = pSampleStreamingSession->mainChannelId;
++                SNPRINTF(filePath, MAX_PATH_LEN, "./h264SampleFrames/main/cam%d/frame-%04d.h264", 
++                        pSampleStreamingSession->mainChannelId%8, fileIndex);
++                DLOGV("%s", filePath);
++                // CHK_STATUS(readFrameFromDisk(NULL, &frameSize, filePath));
++                status = readFrameFromDisk(NULL, &frameSize, filePath);
+                 if (status != STATUS_SUCCESS) {
+-#ifdef VERBOSE
+-                    printf("writeFrame() failed with 0x%08x\n", status);
+-#endif
++                    continue;
++                }
++                // Re-alloc if needed
++                if (frameSize > pSampleConfiguration->videoBufferSize) {
++                    pSampleConfiguration->pVideoFrameBuffer = (PBYTE) MEMREALLOC(pSampleConfiguration->pVideoFrameBuffer, frameSize);
++                    CHK_ERR(pSampleConfiguration->pVideoFrameBuffer != NULL, STATUS_NOT_ENOUGH_MEMORY, "[KVS Master] Failed to allocate video frame buffer");
++                    pSampleConfiguration->videoBufferSize = frameSize;
++                }
++                frame.size = frameSize;
++                frame.frameData = pSampleConfiguration->pVideoFrameBuffer;
++                // CHK_STATUS(readFrameFromDisk(frame.frameData, &frameSize, filePath));
++                status = readFrameFromDisk(frame.frameData, &frameSize, filePath);
++                if (status != STATUS_SUCCESS) {
++                    continue;
++                }
++                frame.presentationTs = pSampleStreamingSession->videoTimestamp;
++                frame.decodingTs = frame.presentationTs;
++                pSampleStreamingSession->videoTimestamp += SAMPLE_VIDEO_FRAME_DURATION;
++                status = writeFrame(pSampleConfiguration->sampleStreamingSessionList[i]->pVideoRtcRtpTransceiver, &frame, streamId);
++                if (status != STATUS_SRTP_NOT_READY_YET) {
++                    if (status != STATUS_SUCCESS) {
++                        DLOGE("writeFrame() failed with 0x%08x", status);
++                    }
+                 }
+             }
+         }
+         MUTEX_UNLOCK(pSampleConfiguration->streamingSessionListReadLock);
+-
+-        // Adjust sleep in the case the sleep itself and writeFrame take longer than expected. Since sleep makes sure that the thread
+-        // will be paused at least until the given amount, we can assume that there's no too early frame scenario.
+-        // Also, it's very unlikely to have a delay greater than SAMPLE_VIDEO_FRAME_DURATION, so the logic assumes that this is always
+-        // true for simplicity.
+-        elapsed = lastFrameTime - startTime;
+-        THREAD_SLEEP(SAMPLE_VIDEO_FRAME_DURATION - elapsed % SAMPLE_VIDEO_FRAME_DURATION);
+         lastFrameTime = GETTIME();
++        elapsed = lastFrameTime - startTime;
++        DLOGV("elapsed: %d video duration: %d", elapsed, SAMPLE_VIDEO_FRAME_DURATION);
++        if (elapsed < SAMPLE_VIDEO_FRAME_DURATION) {
++            THREAD_SLEEP(SAMPLE_VIDEO_FRAME_DURATION - elapsed);
++        }
+     }
+ 
+ CleanUp:
+@@ -342,10 +447,9 @@ PVOID sendAudioPackets(PVOID args)
+         }
+ 
+         frame.presentationTs += SAMPLE_AUDIO_FRAME_DURATION;
+-
+         MUTEX_LOCK(pSampleConfiguration->streamingSessionListReadLock);
+         for (i = 0; i < pSampleConfiguration->streamingSessionCount; ++i) {
+-            status = writeFrame(pSampleConfiguration->sampleStreamingSessionList[i]->pAudioRtcRtpTransceiver, &frame);
++            status = writeFrame(pSampleConfiguration->sampleStreamingSessionList[i]->pAudioRtcRtpTransceiver, &frame, 0);
+             if (status != STATUS_SRTP_NOT_READY_YET) {
+                 if (status != STATUS_SUCCESS) {
+ #ifdef VERBOSE
+diff --git a/samples/kvsWebRTCClientMasterGstreamerSample.c b/samples/kvsWebRTCClientMasterGstreamerSample.c
+index 185859bd5..1599ce07f 100644
+--- a/samples/kvsWebRTCClientMasterGstreamerSample.c
++++ b/samples/kvsWebRTCClientMasterGstreamerSample.c
+@@ -1,10 +1,144 @@
+ #include "Samples.h"
++#include "kvsRtspSrc.h"
+ #include <gst/gst.h>
+ #include <gst/app/gstappsink.h>
+ 
++#include "kvsRtspSrc.c"
++
+ extern PSampleConfiguration gSampleConfiguration;
+ 
+-// #define VERBOSE
++static RtspServerConfiguration rtspServerConfigPreview[MAX_RSTP_CAMERA_SUPPORTED] = {};
++
++static RtspServerConfiguration rtspServerConfigMain[MAX_RSTP_CAMERA_SUPPORTED] = {};
++
++static UINT32 previewTranscoding[MAX_RSTP_CAMERA_SUPPORTED];
++static UINT32 mainTranscoding[MAX_RSTP_CAMERA_SUPPORTED];
++
++#define MAX_MAIN_PREVIEW_MODE_MESSAGE_LEN 256
++const char RTP_MIX[] = "webrtc_rtp_mix";
++const char CAM_ID[] = "maincam_id";
++static UINT32 timeStampStreamId = 0;
++static UINT32 firstFrame = 0;
++static UINT32 lastRunPreview = 1;
++
++#define GST_BUF_QUEUE_SIZE 8
++typedef struct {
++    PFrame pFrame;
++    PBYTE pFrameData;
++} GstKvsFrame, *PGstKvsFrame;
++
++typedef struct {
++    UINT32 size;
++    UINT32 head;
++    UINT32 tail;
++    UINT32 dataBufSize;
++    PVOID queue[GST_BUF_QUEUE_SIZE];
++} GstBufQue, *PGstBufQue;
++
++static GstBufQue previewQueue[MAX_RSTP_CAMERA_SUPPORTED];
++static GstBufQue mainQueue[MAX_RSTP_CAMERA_SUPPORTED];
++
++VOID gstBufQueueInit(PGstBufQue pQueue) {
++    UINT32 i;
++
++    pQueue->size = GST_BUF_QUEUE_SIZE;
++    pQueue->head = 0;
++    pQueue->tail = 0;
++    for (i = 0; i < GST_BUF_QUEUE_SIZE; i++) {
++        pQueue->queue[i] = NULL;
++    }
++}
++
++VOID gstBufQueueInitWithBuffer(PGstBufQue pQueue, PVOID p) {
++    UINT32 i;
++    PFrame pFrame = (PFrame)p;
++    pQueue->size = GST_BUF_QUEUE_SIZE;
++    pQueue->head = 0;
++    pQueue->tail = 0;
++    for (i = 0; i < GST_BUF_QUEUE_SIZE; i++) {
++        pQueue->queue[i] = pFrame;
++        pFrame++;
++    }
++}
++
++BOOL isGstQueueFull(PGstBufQue pQueue) {
++    UINT32 pos;
++
++    pos = pQueue->tail + 1;
++    if (pos == GST_BUF_QUEUE_SIZE) {
++        pos = 0;
++    }
++    if (pos == pQueue->head) {
++        return TRUE;
++    }
++    return FALSE;
++}
++
++BOOL isGstQueueEmpty(PGstBufQue pQueue) {
++
++    if (pQueue->head == pQueue->tail) {
++        return TRUE;
++    }
++    return FALSE;
++}
++
++PVOID gstBufQueueDequeue(PGstBufQue pQueue) {
++    PVOID p = NULL;
++    if (isGstQueueEmpty(pQueue)) {
++        return NULL;
++    }
++    p = pQueue->queue[pQueue->head];
++    pQueue->head++;
++    if (pQueue->head == GST_BUF_QUEUE_SIZE) {
++        pQueue->head = 0;
++    }
++    DLOGV("Dequeued: head %d tail %d", pQueue->head, pQueue->tail);
++    return p;
++}
++
++BOOL gstBufQueueEnqueue(PGstBufQue pQueue, PVOID item) {
++    if (isGstQueueFull(pQueue)) {
++        DLOGV("return false");
++        return FALSE;
++    }
++    pQueue->queue[pQueue->tail] = item;
++    pQueue->tail++;
++    if (pQueue->tail == GST_BUF_QUEUE_SIZE) {
++        pQueue->tail = 0;
++    }
++    DLOGV("enqueued: head %d tail %d", pQueue->head, pQueue->tail);
++    return TRUE;
++}
++
++BOOL gstBufQueueEnqueueCopyData(PGstBufQue pQueue, PVOID item) {
++    PFrame pFrame, p;
++    UINT32 itemSize, frameSize;
++
++    p = (PFrame) item;
++    itemSize = (UINT32)p->size;
++    DLOGI("head: %d tail :%d item size: %d", pQueue->tail, pQueue->tail, itemSize);
++    if (isGstQueueFull(pQueue)) {
++        DLOGI("return False");
++        return FALSE;
++    }
++    if (itemSize > pQueue->dataBufSize) {
++        DLOGE("Frame too large");
++        return FALSE;
++    }
++
++    pFrame = (PFrame)pQueue->queue[pQueue->tail];
++    MEMCPY(pFrame, p, sizeof(Frame));
++    DLOGI("frame: %d", (UINT32)p->size);
++
++    MEMCPY(pFrame->frameData, p->frameData, pFrame->size);
++
++    pQueue->tail++;
++    if (pQueue->tail == GST_BUF_QUEUE_SIZE) {
++        pQueue->tail = 0;
++    }
++    DLOGI("return TRUE");
++    return TRUE;
++}
+ 
+ GstFlowReturn on_new_sample(GstElement* sink, gpointer data, UINT64 trackid)
+ {
+@@ -15,15 +149,20 @@ GstFlowReturn on_new_sample(GstElement* sink, gpointer data, UINT64 trackid)
+     GstMapInfo info;
+     GstSegment* segment;
+     GstClockTime buf_pts;
++    PFrame pFrame;
+     Frame frame;
+-    STATUS status;
+-    PSampleConfiguration pSampleConfiguration = (PSampleConfiguration) data;
++    PSampleConfiguration pSampleConfiguration = gSampleConfiguration;
+     PSampleStreamingSession pSampleStreamingSession = NULL;
+-    PRtcRtpTransceiver pRtcRtpTransceiver = NULL;
+-    UINT32 i;
++    UINT32 i, frameSize, naluLength;
++    BOOL startFrame = TRUE;
++    UINT32 streamId;
++    PGstBufQue pQueue;
+ 
++    MUTEX_LOCK(pSampleConfiguration->streamingSessionListReadLock);
++    DLOGI("trackId: %d", (UINT32)trackid);
+     if (pSampleConfiguration == NULL) {
+         printf("[KVS GStreamer Master] on_new_sample(): operation returned status code: 0x%08x \n", STATUS_NULL_ARG);
++        MUTEX_UNLOCK(pSampleConfiguration->streamingSessionListReadLock);
+         goto CleanUp;
+     }
+ 
+@@ -40,7 +179,6 @@ GstFlowReturn on_new_sample(GstElement* sink, gpointer data, UINT64 trackid)
+     if (!isDroppable) {
+         delta = GST_BUFFER_FLAG_IS_SET(buffer, GST_BUFFER_FLAG_DELTA_UNIT);
+ 
+-        frame.flags = delta ? FRAME_FLAG_NONE : FRAME_FLAG_KEY_FRAME;
+ 
+         // convert from segment timestamp to running time in live mode.
+         segment = gst_sample_get_segment(sample);
+@@ -51,41 +189,42 @@ GstFlowReturn on_new_sample(GstElement* sink, gpointer data, UINT64 trackid)
+ 
+         if (!(gst_buffer_map(buffer, &info, GST_MAP_READ))) {
+             printf("[KVS GStreamer Master] on_new_sample(): Gst buffer mapping failed\n");
++            MUTEX_UNLOCK(pSampleConfiguration->streamingSessionListReadLock);
+             goto CleanUp;
+         }
+ 
+-        frame.trackId = trackid;
+-        frame.duration = 0;
+-        frame.version = FRAME_CURRENT_VERSION;
+-        frame.size = (UINT32) info.size;
+-        frame.frameData = (PBYTE) info.data;
++        streamId = (UINT32) trackid;
++        pFrame = (PFrame) MEMALLOC(sizeof(Frame));
++        if (pFrame == NULL) {
++            DLOGE("Frame allocation failed");
++        }
++        pFrame->flags = delta ? FRAME_FLAG_NONE : FRAME_FLAG_KEY_FRAME;
++        pFrame->trackId = trackid;
++        pFrame->duration = 0;
++        pFrame->version = FRAME_CURRENT_VERSION;
++        pFrame->size = info.size;
++
++        pFrame->frameData = (PBYTE)MEMALLOC(info.size);
++        if (pFrame->frameData == NULL) {
++            DLOGE("Frame data allocation failed");
++        }
++        MEMCPY(pFrame->frameData, info.data, info.size);
+ 
+-        MUTEX_LOCK(pSampleConfiguration->streamingSessionListReadLock);
+-        for (i = 0; i < pSampleConfiguration->streamingSessionCount; ++i) {
+-            pSampleStreamingSession = pSampleConfiguration->sampleStreamingSessionList[i];
+-            frame.index = (UINT32) ATOMIC_INCREMENT(&pSampleStreamingSession->frameIndex);
+-
+-            if (trackid == DEFAULT_AUDIO_TRACK_ID) {
+-                pRtcRtpTransceiver = pSampleStreamingSession->pAudioRtcRtpTransceiver;
+-                frame.presentationTs = pSampleStreamingSession->audioTimestamp;
+-                frame.decodingTs = frame.presentationTs;
+-                pSampleStreamingSession->audioTimestamp +=
+-                    SAMPLE_AUDIO_FRAME_DURATION; // assume audio frame size is 20ms, which is default in opusenc
+-            } else {
+-                pRtcRtpTransceiver = pSampleStreamingSession->pVideoRtcRtpTransceiver;
+-                frame.presentationTs = pSampleStreamingSession->videoTimestamp;
+-                frame.decodingTs = frame.presentationTs;
+-                pSampleStreamingSession->videoTimestamp += SAMPLE_VIDEO_FRAME_DURATION; // assume video fps is 30
+-            }
+-            status = writeFrame(pRtcRtpTransceiver, &frame);
+-            if (status != STATUS_SRTP_NOT_READY_YET && status != STATUS_SUCCESS) {
+-#ifdef VERBOSE
+-                printf("writeFrame() failed with 0x%08x", status);
+-#endif
+-            }
++        if (streamId < MAX_RSTP_CAMERA_SUPPORTED) {
++            pQueue = &previewQueue[streamId];
++        } else {
++            pQueue = &mainQueue[streamId - MAX_RSTP_CAMERA_SUPPORTED];
++        }
++        // over written oldest one
++        if (!gstBufQueueEnqueue(pQueue, (PVOID)pFrame)) {
++            PFrame p;
++            p = gstBufQueueDequeue(pQueue);
++            MEMFREE(p->frameData);
++            MEMFREE(p);
++            gstBufQueueEnqueue(pQueue, (PVOID)pFrame);
+         }
+-        MUTEX_UNLOCK(pSampleConfiguration->streamingSessionListReadLock);
+     }
++    MUTEX_UNLOCK(pSampleConfiguration->streamingSessionListReadLock);
+ 
+ CleanUp:
+ 
+@@ -97,16 +236,12 @@ CleanUp:
+         gst_sample_unref(sample);
+     }
+ 
+-    if (ATOMIC_LOAD_BOOL(&pSampleConfiguration->appTerminateFlag)) {
+-        ret = GST_FLOW_EOS;
+-    }
+-
+     return ret;
+ }
+ 
+ GstFlowReturn on_new_sample_video(GstElement* sink, gpointer data)
+ {
+-    return on_new_sample(sink, data, DEFAULT_VIDEO_TRACK_ID);
++
+ }
+ 
+ GstFlowReturn on_new_sample_audio(GstElement* sink, gpointer data)
+@@ -114,120 +249,308 @@ GstFlowReturn on_new_sample_audio(GstElement* sink, gpointer data)
+     return on_new_sample(sink, data, DEFAULT_AUDIO_TRACK_ID);
+ }
+ 
+-PVOID sendGstreamerAudioVideo(PVOID args)
+-{
++STATUS gstreamerUpdatePreviewState(PVOID args, INT32 state) {
+     STATUS retStatus = STATUS_SUCCESS;
+-    GstElement *appsinkVideo = NULL, *appsinkAudio = NULL, *pipeline = NULL;
+-    GstBus* bus;
+-    GstMessage* msg;
+-    GError* error = NULL;
+-    PSampleConfiguration pSampleConfiguration = (PSampleConfiguration) args;
++    int i, pipelineState;
++    PSampleConfiguration pSampleConfiguration = (PSampleConfiguration)args;
++    PRtspSrcContext pPRtspSrcContext;
++    GstElement* pipeline = NULL;
++
++    pPRtspSrcContext = (PRtspSrcContext)pSampleConfiguration->pMediaContextPreview[0];
++    pipelineState = pPRtspSrcContext->codecConfiguration.pipelineStatus;
++    DLOGI("state %d %d", state, pipelineState);
++    if (pipelineState == state) {
++        return retStatus;
++    }
++
++    for (i = 0; i < pSampleConfiguration->numOfCameras; i++) {
++        pPRtspSrcContext = (PRtspSrcContext)pSampleConfiguration->pMediaContextPreview[i];
++        pipeline = pPRtspSrcContext->codecConfiguration.pipeline;
++        if (pipeline != NULL) {
++            if (state == RTSP_PIPELINE_STATUS_PLAYING) {
++                gst_element_set_state(pipeline, GST_STATE_PLAYING);
++                pPRtspSrcContext->codecConfiguration.pipelineStatus = RTSP_PIPELINE_STATUS_PLAYING;
++            } else {
++                gst_element_set_state(pipeline, GST_STATE_PAUSED);
++                pPRtspSrcContext->codecConfiguration.pipelineStatus = RTSP_PIPELINE_STATUS_PAUSED;
++            }
++        }
++    }
+ 
+-    if (pSampleConfiguration == NULL) {
+-        printf("[KVS GStreamer Master] sendGstreamerAudioVideo(): operation returned status code: 0x%08x \n", STATUS_NULL_ARG);
+-        goto CleanUp;
++    return retStatus;
++
++}
++
++STATUS gstreamerUpdateMainStreamState(PVOID args, INT32 state, INT32 streamId) {
++
++    STATUS retStatus = STATUS_SUCCESS;
++    int i;
++    volatile int pipelineState;
++    PSampleConfiguration pSampleConfiguration = (PSampleConfiguration)args;
++    PRtspSrcContext pPRtspSrcContext;
++    GstElement* pipeline = NULL;
++
++    DLOGI("state %d, streamId %d", state, streamId);
++    pPRtspSrcContext = (PRtspSrcContext)pSampleConfiguration->pMediaContextMain[streamId];
++    pipelineState = pPRtspSrcContext->codecConfiguration.pipelineStatus;
++
++    DLOGI("next state %d, curr state %d streamId %d", state, pipelineState, streamId);
++    // check wether current state is null and next state is pause, do nothing
++    if (pipelineState == RTSP_PIPELINE_STATUS_NULL) {
++        if (state == RTSP_PIPELINE_STATUS_PAUSED) {
++            //doing nothing
++            return retStatus;
++        } else {
++            // next state is playing
++            THREAD_CREATE(&pSampleConfiguration->rstpMainTid[i], runMediaSource, (PVOID) pPRtspSrcContext);
++            THREAD_SLEEP(SAMPLE_VIDEO_FRAME_DURATION);
++        }
+     }
+ 
+-    /**
+-     * Use x264enc as its available on mac, pi, ubuntu and windows
+-     * mac pipeline fails if resolution is not 720p
+-     *
+-     * For alaw
+-     * audiotestsrc is-live=TRUE ! queue leaky=2 max-size-buffers=400 ! audioconvert ! audioresample !
+-     * audio/x-raw, rate=8000, channels=1, format=S16LE, layout=interleaved ! alawenc ! appsink sync=TRUE emit-signals=TRUE name=appsink-audio
+-     *
+-     * For VP8
+-     * videotestsrc is-live=TRUE ! video/x-raw,width=1280,height=720,framerate=30/1 !
+-     * vp8enc error-resilient=partitions keyframe-max-dist=10 auto-alt-ref=true cpu-used=5 deadline=1 !
+-     * appsink sync=TRUE emit-signals=TRUE name=appsink-video
+-     */
+-
+-    switch (pSampleConfiguration->mediaType) {
+-        case SAMPLE_STREAMING_VIDEO_ONLY:
+-            if (pSampleConfiguration->useTestSrc) {
+-                pipeline = gst_parse_launch(
+-                    "videotestsrc is-live=TRUE ! queue ! videoconvert ! video/x-raw,width=1280,height=720,framerate=30/1 ! "
+-                    "x264enc bframes=0 speed-preset=veryfast bitrate=512 byte-stream=TRUE tune=zerolatency ! "
+-                    "video/x-h264,stream-format=byte-stream,alignment=au,profile=baseline ! appsink sync=TRUE emit-signals=TRUE name=appsink-video",
+-                    &error);
+-            } else {
+-                pipeline = gst_parse_launch(
+-                    "autovideosrc ! queue ! videoconvert ! video/x-raw,width=1280,height=720,framerate=[30/1,10000000/333333] ! "
+-                    "x264enc bframes=0 speed-preset=veryfast bitrate=512 byte-stream=TRUE tune=zerolatency ! "
+-                    "video/x-h264,stream-format=byte-stream,alignment=au,profile=baseline ! appsink sync=TRUE emit-signals=TRUE name=appsink-video",
+-                    &error);
+-            }
+-            break;
++    // recheck pipelineStatus
++    pipelineState = pPRtspSrcContext->codecConfiguration.pipelineStatus;
++    if (pipelineState == state) {
++        return retStatus;
++    }
++    pipeline = pPRtspSrcContext->codecConfiguration.pipeline;
++    if (pipeline != NULL) {
++        if (state == RTSP_PIPELINE_STATUS_PLAYING) {
++            gst_element_set_state(pipeline, GST_STATE_PLAYING);
++            pPRtspSrcContext->codecConfiguration.pipelineStatus = RTSP_PIPELINE_STATUS_PLAYING;
++        } else if (state == RTSP_PIPELINE_STATUS_PAUSED) {
++            gst_element_set_state(pipeline, GST_STATE_PAUSED);
++            pPRtspSrcContext->codecConfiguration.pipelineStatus = RTSP_PIPELINE_STATUS_PAUSED;
++        }
++    }
++
++    return retStatus;
++}
++
++STATUS updateMultiStreamSourceState(PVOID args) {
++    STATUS retStatus = STATUS_SUCCESS;
++    PSampleConfiguration pSampleConfiguration = (PSampleConfiguration)args;
++    INT32 streamId;
++    PRtspSrcContext pPRtspSrcContext;
++    INT32 i;
++    PSampleStreamingSession pStreamingSession;
++    BOOL pauseFlag, pauseMain[MAX_RSTP_CAMERA_SUPPORTED];
+ 
+-        case SAMPLE_STREAMING_AUDIO_VIDEO:
+-            if (pSampleConfiguration->useTestSrc) {
+-                pipeline = gst_parse_launch("videotestsrc is-live=TRUE ! queue ! videoconvert ! video/x-raw,width=1280,height=720,framerate=30/1 ! "
+-                                            "x264enc bframes=0 speed-preset=veryfast bitrate=512 byte-stream=TRUE tune=zerolatency ! "
+-                                            "video/x-h264,stream-format=byte-stream,alignment=au,profile=baseline ! appsink sync=TRUE "
+-                                            "emit-signals=TRUE name=appsink-video audiotestsrc is-live=TRUE ! "
+-                                            "queue leaky=2 max-size-buffers=400 ! audioconvert ! audioresample ! opusenc ! "
+-                                            "audio/x-opus,rate=48000,channels=2 ! appsink sync=TRUE emit-signals=TRUE name=appsink-audio",
+-                                            &error);
++    pauseFlag = TRUE;
++    for (i = 0; i < MAX_RSTP_CAMERA_SUPPORTED; i++) {
++        pauseMain[i] = TRUE;
++    }
++
++    for (i = 0; i < pSampleConfiguration->streamingSessionCount; ++i) {
++        pStreamingSession = pSampleConfiguration->sampleStreamingSessionList[i];
++        if (!ATOMIC_LOAD_BOOL(&pSampleConfiguration->appTerminateFlag)) {
++
++            if (pStreamingSession->sendMultiChannelPreview == 1) {
++                pauseFlag = FALSE;
+             } else {
+-                pipeline =
+-                    gst_parse_launch("autovideosrc ! queue ! videoconvert ! video/x-raw,width=1280,height=720,framerate=[30/1,10000000/333333] ! "
+-                                     "x264enc bframes=0 speed-preset=veryfast bitrate=512 byte-stream=TRUE tune=zerolatency ! "
+-                                     "video/x-h264,stream-format=byte-stream,alignment=au,profile=baseline ! appsink sync=TRUE emit-signals=TRUE "
+-                                     "name=appsink-video autoaudiosrc ! "
+-                                     "queue leaky=2 max-size-buffers=400 ! audioconvert ! audioresample ! opusenc ! "
+-                                     "audio/x-opus,rate=48000,channels=2 ! appsink sync=TRUE emit-signals=TRUE name=appsink-audio",
+-                                     &error);
++                streamId = pStreamingSession->mainChannelId;
++                pauseMain[streamId] = FALSE;
+             }
+-            break;
++        }
+     }
+ 
+-    if (pipeline == NULL) {
+-        printf("[KVS GStreamer Master] sendGstreamerAudioVideo(): Failed to launch gstreamer, operation returned status code: 0x%08x \n",
+-               STATUS_INTERNAL_ERROR);
+-        goto CleanUp;
++    if (pauseFlag) {
++        gstreamerUpdatePreviewState(pSampleConfiguration, RTSP_PIPELINE_STATUS_PAUSED);
++    } else {
++        gstreamerUpdatePreviewState(pSampleConfiguration, RTSP_PIPELINE_STATUS_PLAYING);
+     }
+ 
+-    appsinkVideo = gst_bin_get_by_name(GST_BIN(pipeline), "appsink-video");
+-    appsinkAudio = gst_bin_get_by_name(GST_BIN(pipeline), "appsink-audio");
+-
+-    if (!(appsinkVideo != NULL || appsinkAudio != NULL)) {
+-        printf("[KVS GStreamer Master] sendGstreamerAudioVideo(): cant find appsink, operation returned status code: 0x%08x \n",
+-               STATUS_INTERNAL_ERROR);
+-        goto CleanUp;
++    for (i = 0; i < pSampleConfiguration->numOfCameras; i++) {
++        if (pauseMain[i]) {
++            gstreamerUpdateMainStreamState(pSampleConfiguration, RTSP_PIPELINE_STATUS_PAUSED, i);
++        } else {
++            gstreamerUpdateMainStreamState(pSampleConfiguration, RTSP_PIPELINE_STATUS_PLAYING, i);
++        }
+     }
+ 
+-    if (appsinkVideo != NULL) {
+-        g_signal_connect(appsinkVideo, "new-sample", G_CALLBACK(on_new_sample_video), (gpointer) pSampleConfiguration);
++    return retStatus;
++}
++
++PVOID sendGstreamerAudioVideo(PVOID args)
++{
++    GstBus* bus;
++    GstMessage* msg;
++    GError* error = NULL;
++    int i, j, state;
++    PSampleConfiguration pSampleConfiguration = gSampleConfiguration;
++    PSampleStreamingSession pSampleStreamingSession = NULL;
++    PRtcRtpTransceiver pRtcRtpTransceiver = NULL;
++    PRtspSrcContext pPRtspSrcContext;
++    PFrame pFrame;
++    PGstBufQue pQueue;
++    UINT32 streamId;
++    UINT64 startTime, elapsed;
++    STATUS status;
++    BOOL checkFlag = TRUE;
++
++    DLOGD("start transcoding pipeline");
++    for (i = 0; i < pSampleConfiguration->numOfCameras; i++) {
++        pPRtspSrcContext = (PRtspSrcContext) pSampleConfiguration->pMediaContextPreview[i];
++        if (pPRtspSrcContext->codecConfiguration.transcoding ) {
++            THREAD_CREATE(&pSampleConfiguration->rstpPreviewTid[i], runMediaSource, (PVOID) pSampleConfiguration->pMediaContextPreview[i]);
++            THREAD_SLEEP(SAMPLE_VIDEO_FRAME_DURATION);
++        }
+     }
+ 
+-    if (appsinkAudio != NULL) {
+-        g_signal_connect(appsinkAudio, "new-sample", G_CALLBACK(on_new_sample_audio), (gpointer) pSampleConfiguration);
++    while (!ATOMIC_LOAD_BOOL(&pSampleConfiguration->appTerminateFlag)) {
++        if (checkFlag) {
++            updateMultiStreamSourceState(pSampleConfiguration);
++        }
++        checkFlag = TRUE;
++        startTime = GETTIME();
++        MUTEX_LOCK(pSampleConfiguration->streamingSessionListReadLock);
++        for (i = 0; i < pSampleConfiguration->streamingSessionCount; ++i) {
++            pSampleStreamingSession = pSampleConfiguration->sampleStreamingSessionList[i];
++            checkFlag = FALSE;
++            if (pSampleStreamingSession->sendMultiChannelPreview == 1) {
++                for (j = 0; j < pSampleConfiguration->numOfCameras; j++) {
++                    pQueue = &previewQueue[j];
++                    pFrame = (PFrame) gstBufQueueDequeue(pQueue);
++                    if (pFrame != NULL) {
++                        streamId = (UINT32)pFrame->trackId;
++                        if (firstFrame == 0) {
++                            timeStampStreamId = streamId;
++                            firstFrame = 1;
++                        }
++                        DLOGI("sending preview: streamId = %d", streamId);
++                        pFrame->index = (UINT32) ATOMIC_INCREMENT(&pSampleStreamingSession->frameIndex);
++                        pRtcRtpTransceiver = pSampleStreamingSession->pVideoRtcRtpTransceiver;
++                        pFrame->presentationTs = pSampleStreamingSession->videoTimestamp;
++                        pFrame->decodingTs = pFrame->presentationTs;
++                        if (streamId == timeStampStreamId) {
++                            pSampleStreamingSession->videoTimestamp += SAMPLE_VIDEO_FRAME_DURATION;
++                        }
++                        status = writeFrame(pRtcRtpTransceiver, pFrame, streamId);
++                        if (status != STATUS_SRTP_NOT_READY_YET && status != STATUS_SUCCESS) {
++                            DLOGW("writeFrame() failed with 0x%08x", status);
++                        }
++                        MEMFREE(pFrame->frameData);
++                        MEMFREE(pFrame);
++                    }
++                }
++            } else {
++                DLOGV("main: %d", pSampleStreamingSession->sendMultiChannelPreview);
++                pQueue = &mainQueue[pSampleStreamingSession->mainChannelId];
++                pFrame = (PFrame) gstBufQueueDequeue(pQueue);
++                if (pFrame != NULL) {
++                    streamId = (UINT32) pFrame->trackId;
++                    DLOGD("main streamId = %d", streamId);
++                    pFrame->index = (UINT32) ATOMIC_INCREMENT(&pSampleStreamingSession->frameIndex);
++                    pRtcRtpTransceiver = pSampleStreamingSession->pVideoRtcRtpTransceiver;
++                    pFrame->presentationTs = pSampleStreamingSession->videoTimestamp;
++                    pFrame->decodingTs = pFrame->presentationTs;
++                    pSampleStreamingSession->videoTimestamp += SAMPLE_VIDEO_FRAME_DURATION; // assume video fps is 30
++                    status = writeFrame(pRtcRtpTransceiver, pFrame, streamId - MAX_RSTP_CAMERA_SUPPORTED);
++                    if (status != STATUS_SRTP_NOT_READY_YET && status != STATUS_SUCCESS) {
++                        DLOGW("writeFrame() failed with 0x%08x", status);
++                    }
++                    MEMFREE(pFrame->frameData);
++                    MEMFREE(pFrame);
++                }
++            }
++        }
++        MUTEX_UNLOCK(pSampleConfiguration->streamingSessionListReadLock);
++        elapsed = GETTIME() - startTime;
++        DLOGI("Video sending elapsed : %d", (UINT32)elapsed);
++        if (elapsed < SAMPLE_VIDEO_FRAME_DURATION) {
++            THREAD_SLEEP(SAMPLE_VIDEO_FRAME_DURATION - elapsed);
++        }
+     }
++}
+ 
+-    gst_element_set_state(pipeline, GST_STATE_PLAYING);
+ 
+-    /* block until error or EOS */
+-    bus = gst_element_get_bus(pipeline);
+-    msg = gst_bus_timed_pop_filtered(bus, GST_CLOCK_TIME_NONE, GST_MESSAGE_ERROR | GST_MESSAGE_EOS);
++static STATUS onMediaEosHook(PVOID udata)
++{
++    STATUS retStatus = STATUS_SUCCESS;
++    PSampleConfiguration pSampleConfiguration = (PSampleConfiguration) udata;
++    UINT32 i;
+ 
+-    /* Free resources */
+-    if (msg != NULL) {
+-        gst_message_unref(msg);
+-    }
+-    gst_object_unref(bus);
+-    gst_element_set_state(pipeline, GST_STATE_NULL);
+-    gst_object_unref(pipeline);
++    return retStatus;
++}
+ 
+-CleanUp:
++void updateGstPipelineAfterInit(PVOID args)
++{
++    THREAD_SLEEP(SAMPLE_VIDEO_FRAME_DURATION*300);
++    updateMultiStreamSourceState(args);
++}
+ 
+-    if (error != NULL) {
+-        printf("%s", error->message);
+-        g_clear_error(&error);
++STATUS initGstVideoPipeline(PSampleConfiguration pSampleConfiguration)
++{
++    STATUS status = STATUS_SUCCESS;
++    int i, j;
++    PRtspSrcContext pPRtspSrcContext;
++    PGstBufQue pQueue;
++    PFrame pFrame, p;
++    PBYTE pFrameData, pBuf;
++    TID stateUpdateTid;
++
++    for (i = 0; i < pSampleConfiguration->numOfCameras; i++) {
++        initMediaSource(&pSampleConfiguration->pMediaContextPreview[i], &rtspServerConfigPreview[i]);
++        pPRtspSrcContext = (PRtspSrcContext) pSampleConfiguration->pMediaContextPreview[i];
++        SNPRINTF(pPRtspSrcContext->codecConfiguration.pipelineName, GST_PIPELINE_NAME_MAX_NAME - 1, "kvs-preview-pipeline%d", i);
++        pPRtspSrcContext->codecConfiguration.id = i;
++        pPRtspSrcContext->codecConfiguration.preview = TRUE;
++        pPRtspSrcContext->codecConfiguration.transcoding = previewTranscoding[i];
++        linkMeidaEosHook(pPRtspSrcContext, onMediaEosHook, (PVOID)pSampleConfiguration);
++        initMediaSource(&pSampleConfiguration->pMediaContextMain[i], &rtspServerConfigMain[i]);
++        pPRtspSrcContext = (PRtspSrcContext) pSampleConfiguration->pMediaContextMain[i];
++        SNPRINTF(pPRtspSrcContext->codecConfiguration.pipelineName, GST_PIPELINE_NAME_MAX_NAME - 1, "kvs-main-pipeline%d", i);
++        pPRtspSrcContext->codecConfiguration.id = i + MAX_RSTP_CAMERA_SUPPORTED;
++        pPRtspSrcContext->codecConfiguration.preview = FALSE;
++        pPRtspSrcContext->codecConfiguration.transcoding = mainTranscoding[i];
++        linkMeidaEosHook(pPRtspSrcContext, onMediaEosHook, (PVOID)pSampleConfiguration);
++        pQueue = &previewQueue[i];
++        gstBufQueueInit(pQueue);
++        pQueue = &mainQueue[i];
++        gstBufQueueInit(pQueue);
++    }
++
++    // starts passthru pipeline
++    for (i = 0; i < pSampleConfiguration->numOfCameras; i++) {
++        pPRtspSrcContext = (PRtspSrcContext) pSampleConfiguration->pMediaContextPreview[i];
++        if (pPRtspSrcContext->codecConfiguration.transcoding == 0 ) {
++            THREAD_CREATE(&pSampleConfiguration->rstpPreviewTid[i], runMediaSource, (PVOID) pSampleConfiguration->pMediaContextPreview[i]);
++            THREAD_SLEEP(SAMPLE_VIDEO_FRAME_DURATION);
++        }
++        pPRtspSrcContext = (PRtspSrcContext) pSampleConfiguration->pMediaContextMain[i];
++        if (pPRtspSrcContext->codecConfiguration.transcoding == 0) {
++            THREAD_CREATE(&pSampleConfiguration->rstpMainTid[i], runMediaSource, (PVOID) pSampleConfiguration->pMediaContextMain[i]);
++            THREAD_SLEEP(SAMPLE_VIDEO_FRAME_DURATION );
++        }
+     }
++    // starts thread to update pipeline state in 10 second
++    THREAD_CREATE(&stateUpdateTid, updateGstPipelineAfterInit, (PVOID) pSampleConfiguration);
+ 
+-    return (PVOID) (ULONG_PTR) retStatus;
++    return 0;
+ }
+ 
++VOID freeGstVideoPipeline(PSampleConfiguration pSampleConfiguration) {
++    int i;
++    PRtspSrcContext pPRtspSrcContext;
++
++    for (i = 0; i < pSampleConfiguration->numOfCameras; i++) {
++        pPRtspSrcContext = (PRtspSrcContext) pSampleConfiguration->pMediaContextPreview[i];
++        if (pPRtspSrcContext != NULL) {
++            shutdownMediaSource(pPRtspSrcContext);
++        }
++        if (pSampleConfiguration->rstpPreviewTid[i] != INVALID_TID_VALUE) {
++            THREAD_JOIN(pSampleConfiguration->rstpPreviewTid[i], NULL);
++        }
++        pPRtspSrcContext = (PRtspSrcContext) pSampleConfiguration->pMediaContextMain[i];
++        if (pPRtspSrcContext != NULL) {
++            shutdownMediaSource(pPRtspSrcContext);
++        }
++        if (pSampleConfiguration->rstpMainTid[i] != INVALID_TID_VALUE) {
++            THREAD_JOIN(pSampleConfiguration->rstpMainTid[i], NULL);
++        }
++    }
++}
++
++
+ VOID onGstAudioFrameReady(UINT64 customData, PFrame pFrame)
+ {
+     GstFlowReturn ret;
+@@ -251,7 +574,10 @@ VOID onSampleStreamingSessionShutdown(UINT64 customData, PSampleStreamingSession
+     GstElement* appsrc = (GstElement*) customData;
+     GstFlowReturn ret;
+ 
+-    g_signal_emit_by_name(appsrc, "end-of-stream", &ret);
++    if (pSampleStreamingSession != NULL) {
++        updateMultiStreamSourceState(pSampleStreamingSession);
++    }
++    // g_signal_emit_by_name(appsrc, "end-of-stream", &ret);
+ }
+ 
+ PVOID receiveGstreamerAudioVideo(PVOID args)
+@@ -269,8 +595,6 @@ PVOID receiveGstreamerAudioVideo(PVOID args)
+         goto CleanUp;
+     }
+ 
+-    // TODO: Wire video up with gstreamer pipeline
+-
+     switch (pSampleStreamingSession->pAudioRtcRtpTransceiver->receiver.track.codec) {
+         case RTC_CODEC_OPUS:
+             audioDescription = "appsrc name=appsrc-audio ! opusparse ! decodebin ! autoaudiosink";
+@@ -333,6 +657,148 @@ CleanUp:
+     return (PVOID) (ULONG_PTR) retStatus;
+ }
+ 
++void parseRtspConfiguration(char *filePath, int camNum) {
++
++    FILE *fp;
++    char line[1024];
++    int c;
++    char *ch;
++    char url[256];
++    char preview[64];
++    char user[64];
++    char passwd[64];
++    char transcoding[64];
++    int i;
++    int pIndex = 0, mIndex = 0;
++
++    printf("%s\n", filePath);
++    fp = fopen(filePath, "r");
++    if (fp != NULL) {
++        for (i = 0; i < camNum*2; i++) {
++            ch = &line[0];
++            while ((c = fgetc(fp)) != '\n' && c != EOF) {
++                *ch++ = c;
++            }
++            *ch = '\0';
++            printf("%s\n", line);
++            sscanf(line, "%s %s %s %s %s", url, user, passwd, preview, transcoding);
++            if (!strcmp("preview", preview)) {
++                strcpy(rtspServerConfigPreview[pIndex].url, url);
++                if (strcmp("none", user)) {
++                    strcpy(rtspServerConfigPreview[pIndex].username, user);
++                } else {
++                    rtspServerConfigPreview[pIndex].username[0] = '\0';
++                }
++                if (strcmp("none", passwd)) {
++                    strcpy(rtspServerConfigPreview[pIndex].password, passwd);
++                } else {
++                    rtspServerConfigPreview[pIndex].password[0] = '\0';
++                }
++                DLOGI("preview: %d %s %s %s",pIndex, rtspServerConfigPreview[pIndex].url, rtspServerConfigPreview[pIndex].username,
++                        rtspServerConfigPreview[pIndex].password );
++                if (!strcmp("passthru", transcoding)) {
++                    previewTranscoding[pIndex] = 0;
++                } else if (!strcmp("transcoding", transcoding)) {
++                    previewTranscoding[pIndex] = 1;
++                } else {
++                    previewTranscoding[pIndex] = 2;
++                }
++                pIndex++;
++            } else {
++                strcpy(rtspServerConfigMain[mIndex].url, url);
++                if (strcmp("none", user)) {
++                    strcpy(rtspServerConfigMain[mIndex].username, user);
++                } else {
++                    rtspServerConfigMain[mIndex].username[0] = '\0';
++                }
++                if (strcmp("none", passwd)) {
++                    strcpy(rtspServerConfigMain[mIndex].password, passwd);
++                } else {
++                    rtspServerConfigMain[mIndex].password[0] = '\0';
++                }
++                DLOGI("main: %d %s %s %s",pIndex, rtspServerConfigMain[mIndex].url, rtspServerConfigMain[mIndex].username,
++                        rtspServerConfigMain[mIndex].password );
++                if (!strcmp("passthru", transcoding)) {
++                    mainTranscoding[mIndex] = 0;
++                } else if (!strcmp("transcoding", transcoding)) {
++                    mainTranscoding[mIndex] = 1;
++                } else {
++                    mainTranscoding[mIndex] = 2;
++                }
++                mIndex++;
++            }
++        }
++    }
++}
++
++UINT32 parseDataMessage(char *message, char *parm)
++{
++    UINT32 i, j;
++    UINT32 len = STRLEN(message);
++    char *p;
++    UINT32 parmData;
++    char buf[64];
++
++    i = 0;
++    j = 0;
++    p = &message[j];
++    do {
++        parm[i] = p[i];
++        if (parm[i] == ':') {
++            parm[i] = 0;
++            break;
++        }
++        i++;
++        j++;
++    } while (j < len);
++
++    p = &message[++j];
++    strcpy(buf, p);
++
++    return(atoi(buf));
++}
++
++VOID processDataMessageString(PVOID args, PBYTE pMessage, UINT32 pMessageLen)
++{
++    PSampleStreamingSession pSampleStreamingSession = (PSampleStreamingSession) args;
++    char buf[MAX_MAIN_PREVIEW_MODE_MESSAGE_LEN];
++    char parm[2][MAX_MAIN_PREVIEW_MODE_MESSAGE_LEN];
++    UINT32 parmData[2];
++    char *p;
++
++    UINT32 i, j, len;
++    int k;
++
++    DLOGI("DataChannel String Message: %.*s\n", pMessageLen, pMessage);
++
++    p = pMessage;
++    j = 0;
++    k = 0;
++    for (i=0;i<pMessageLen;i++) {
++        buf[k] = p[i];
++        if (buf[k] == 0x3b || buf[k] == 0xa || buf[k] == 0) {
++            buf[k] = '\0';
++            parmData[j] = parseDataMessage(buf, parm[j]);
++            DLOGI("parm: %s, data=%d", parm[j], parmData[j]);
++            j++;
++            len = i + 1;
++            k = -1;
++        }
++        k++;
++    }
++    if (!strcmp(RTP_MIX, parm[0])) {
++        if (!strcmp(CAM_ID, parm[1])) {
++            pSampleStreamingSession->sendMultiChannelPreview = parmData[0];
++            if (pSampleStreamingSession->sendMultiChannelPreview == 0) {
++                pSampleStreamingSession->mainChannelId = parmData[1];
++            }
++            DLOGI("sendMultiChannelPreview=%d, mainChannelId=%d", pSampleStreamingSession->sendMultiChannelPreview,
++                    pSampleStreamingSession->mainChannelId);
++            updateMultiStreamSourceState(pSampleStreamingSession->pSampleConfiguration);
++        }
++    }
++}
++
+ INT32 main(INT32 argc, CHAR* argv[])
+ {
+     STATUS retStatus = STATUS_SUCCESS;
+@@ -371,43 +837,24 @@ INT32 main(INT32 argc, CHAR* argv[])
+ 
+     pSampleConfiguration->videoSource = sendGstreamerAudioVideo;
+     pSampleConfiguration->mediaType = SAMPLE_STREAMING_VIDEO_ONLY;
+-    pSampleConfiguration->receiveAudioVideoSource = receiveGstreamerAudioVideo;
++    // pSampleConfiguration->receiveAudioVideoSource = receiveGstreamerAudioVideo;
+     pSampleConfiguration->onDataChannel = onDataChannel;
+     pSampleConfiguration->customData = (UINT64) pSampleConfiguration;
+     pSampleConfiguration->useTestSrc = FALSE;
+-    /* Initialize GStreamer */
+-    gst_init(&argc, &argv);
+-    printf("[KVS Gstreamer Master] Finished initializing GStreamer\n");
++    pSampleConfiguration->numOfCameras = 2;
+ 
+     if (argc > 2) {
+-        if (STRCMP(argv[2], "video-only") == 0) {
+-            pSampleConfiguration->mediaType = SAMPLE_STREAMING_VIDEO_ONLY;
+-            printf("[KVS Gstreamer Master] Streaming video only\n");
+-        } else if (STRCMP(argv[2], "audio-video") == 0) {
+-            pSampleConfiguration->mediaType = SAMPLE_STREAMING_AUDIO_VIDEO;
+-            printf("[KVS Gstreamer Master] Streaming audio and video\n");
+-        } else {
+-            printf("[KVS Gstreamer Master] Unrecognized streaming type. Default to video-only\n");
+-        }
+-    } else {
+-        printf("[KVS Gstreamer Master] Streaming video only\n");
++        pSampleConfiguration->numOfCameras = atoi(argv[2]);
++        printf("Num of cameras: %d\n", pSampleConfiguration->numOfCameras);
+     }
+-
+     if (argc > 3) {
+-        if (STRCMP(argv[3], "testsrc") == 0) {
+-            printf("[KVS GStreamer Master] Using test source in GStreamer\n");
+-            pSampleConfiguration->useTestSrc = TRUE;
+-        }
++        parseRtspConfiguration(argv[3], pSampleConfiguration->numOfCameras);
+     }
+ 
+-    switch (pSampleConfiguration->mediaType) {
+-        case SAMPLE_STREAMING_VIDEO_ONLY:
+-            printf("[KVS GStreamer Master] streaming type video-only");
+-            break;
+-        case SAMPLE_STREAMING_AUDIO_VIDEO:
+-            printf("[KVS GStreamer Master] streaming type audio-video");
+-            break;
+-    }
++    /* Initialize GStreamer */
++    gst_init(&argc, &argv);
++
++    printf("[KVS Gstreamer Master] Finished initializing GStreamer\n");
+ 
+     // Initalize KVS WebRTC. This must be done before anything else, and must only be done once.
+     retStatus = initKvsWebRtc();
+@@ -447,6 +894,9 @@ INT32 main(INT32 argc, CHAR* argv[])
+ 
+     gSampleConfiguration = pSampleConfiguration;
+ 
++    // init gstreamer pipeline
++    initGstVideoPipeline(pSampleConfiguration);
++
+     // Checking for termination
+     retStatus = sessionCleanupWait(pSampleConfiguration);
+     if (retStatus != STATUS_SUCCESS) {
+@@ -468,10 +918,12 @@ CleanUp:
+         // Kick of the termination sequence
+         ATOMIC_STORE_BOOL(&pSampleConfiguration->appTerminateFlag, TRUE);
+ 
++        freeGstVideoPipeline(pSampleConfiguration);
++
+         if (pSampleConfiguration->mediaSenderTid != INVALID_TID_VALUE) {
+             THREAD_JOIN(pSampleConfiguration->mediaSenderTid, NULL);
+         }
+-
++        printf("[KVS GStreamer Master] Cleaning up +++1\n");
+         if (pSampleConfiguration->enableFileLogging) {
+             freeFileLogger();
+         }
+@@ -479,7 +931,7 @@ CleanUp:
+         if (retStatus != STATUS_SUCCESS) {
+             printf("[KVS GStreamer Master] freeSignalingClient(): operation returned status code: 0x%08x \n", retStatus);
+         }
+-
++        printf("[KVS GStreamer Master] Cleaning up +++2\n");
+         retStatus = freeSampleConfiguration(&pSampleConfiguration);
+         if (retStatus != STATUS_SUCCESS) {
+             printf("[KVS GStreamer Master] freeSampleConfiguration(): operation returned status code: 0x%08x \n", retStatus);
+diff --git a/samples/rtspconfig.txt b/samples/rtspconfig.txt
+new file mode 100644
+index 000000000..d6c0bd648
+--- /dev/null
++++ b/samples/rtspconfig.txt
+@@ -0,0 +1,16 @@
++rtsp://192.168.31.51:554/stream2 admin Iotlab11 preview passthru
++rtsp://192.168.31.251:554/stream2 admin Iotlab11 preview passthru
++rtsp://192.168.31.52:554/stream2 admin Iotlab11 preview passthru
++rtsp://192.168.31.233:554/stream2 admin Iotlab11 preview passthru
++rtsp://192.168.31.53:8554/unicast none none preview passthru
++rtsp://192.168.31.51:554/stream2 admin Iotlab11 preview passthru
++rtsp://192.168.31.52:554/stream2 admin Iotlab11 preview passthru
++rtsp://192.168.31.251:554/stream2 admin Iotlab11 preview passthru
++rtsp://192.168.31.51:554/stream1 admin Iotlab11 main passthru
++rtsp://192.168.31.251:554/stream1 admin Iotlab11 main passthru
++rtsp://192.168.31.52:554/stream1 admin Iotlab11 main passthru
++rtsp://192.168.31.233:554/stream1 admin Iotlab11 main passthru
++rtsp://192.168.31.53:8554/unicast none none main passthru
++rtsp://192.168.31.51:554/stream1 admin Iotlab11 main passthru
++rtsp://192.168.31.52:554/stream1 admin Iotlab11 main passthru
++rtsp://192.168.31.251:554/stream1 admin Iotlab11 main passthru
+\ No newline at end of file
+diff --git a/src/include/com/amazonaws/kinesis/video/webrtcclient/Include.h b/src/include/com/amazonaws/kinesis/video/webrtcclient/Include.h
+index 6baa03a27..3744a33e3 100644
+--- a/src/include/com/amazonaws/kinesis/video/webrtcclient/Include.h
++++ b/src/include/com/amazonaws/kinesis/video/webrtcclient/Include.h
+@@ -427,7 +427,7 @@ extern "C" {
+ /**
+  * Maximum length of SDP member in RtcSessionDescriptionInit
+  */
+-#define MAX_SESSION_DESCRIPTION_INIT_SDP_LEN 25000
++#define MAX_SESSION_DESCRIPTION_INIT_SDP_LEN 200000
+ 
+ /**
+  * Maximum length of a MediaStream's ID
+@@ -462,7 +462,7 @@ extern "C" {
+ /**
+  * Maximum length of signaling message
+  */
+-#define MAX_SIGNALING_MESSAGE_LEN (10 * 1024)
++#define MAX_SIGNALING_MESSAGE_LEN (200 * 1024)
+ /*!@} */
+ 
+ /////////////////////////////////////////////////////
+@@ -729,6 +729,7 @@ typedef enum {
+     RTC_CODEC_VP8 = 3,                                                            //!< VP8 video codec.
+     RTC_CODEC_MULAW = 4,                                                          //!< MULAW audio codec
+     RTC_CODEC_ALAW = 5,                                                           //!< ALAW audio codec
++    RTC_CODEC_MIXER = 6,
+ } RTC_CODEC;
+ 
+ /**
+@@ -1090,6 +1091,7 @@ typedef struct {
+     BOOL disableSenderSideBandwidthEstimation; //!< Disable TWCC feedback based sender bandwidth estimation, enabled by default.
+                                                //!< You want to set this to TRUE if you are on a very stable connection and want to save 1.2MB of
+                                                //!< memory
++    UINT32 videoMediaCount; //tracks how many video media streams
+ } KvsRtcConfiguration, *PKvsRtcConfiguration;
+ 
+ /**
+@@ -1767,7 +1769,7 @@ PUBLIC_API STATUS addSupportedCodec(PRtcPeerConnection, RTC_CODEC);
+  *
+  * @return STATUS code of the execution. STATUS_SUCCESS on success
+  */
+-PUBLIC_API STATUS writeFrame(PRtcRtpTransceiver, PFrame);
++PUBLIC_API STATUS writeFrame(PRtcRtpTransceiver, PFrame, UINT32);
+ 
+ /** @brief call this function to update stats which depend on external encoder
+  *  @param[in] PRtcRtpTransceiver transceiver for which encoder stats will be updated
+diff --git a/src/source/Ice/IceAgent.h b/src/source/Ice/IceAgent.h
+index 0b02b8784..167ede333 100644
+--- a/src/source/Ice/IceAgent.h
++++ b/src/source/Ice/IceAgent.h
+@@ -11,8 +11,8 @@ extern "C" {
+ #endif
+ 
+ #define KVS_ICE_MAX_CANDIDATE_PAIR_COUNT                       1024
+-#define KVS_ICE_MAX_REMOTE_CANDIDATE_COUNT                     100
+-#define KVS_ICE_MAX_LOCAL_CANDIDATE_COUNT                      100
++#define KVS_ICE_MAX_REMOTE_CANDIDATE_COUNT                     200
++#define KVS_ICE_MAX_LOCAL_CANDIDATE_COUNT                      200
+ #define KVS_ICE_GATHER_REFLEXIVE_AND_RELAYED_CANDIDATE_TIMEOUT (10 * HUNDREDS_OF_NANOS_IN_A_SECOND)
+ #define KVS_ICE_CONNECTIVITY_CHECK_TIMEOUT                     (10 * HUNDREDS_OF_NANOS_IN_A_SECOND)
+ #define KVS_ICE_CANDIDATE_NOMINATION_TIMEOUT                   (10 * HUNDREDS_OF_NANOS_IN_A_SECOND)
+@@ -34,7 +34,7 @@ extern "C" {
+ #define STUN_HEADER_MAGIC_BYTE_OFFSET 4
+ 
+ #define KVS_ICE_MAX_RELAY_CANDIDATE_COUNT                  4
+-#define KVS_ICE_MAX_NEW_LOCAL_CANDIDATES_TO_REPORT_AT_ONCE 10
++#define KVS_ICE_MAX_NEW_LOCAL_CANDIDATES_TO_REPORT_AT_ONCE 16
+ 
+ // https://tools.ietf.org/html/rfc5245#section-4.1.2.1
+ #define ICE_PRIORITY_HOST_CANDIDATE_TYPE_PREFERENCE             126
+diff --git a/src/source/Ice/TurnConnection.h b/src/source/Ice/TurnConnection.h
+index 54df2bc28..f9e0de569 100644
+--- a/src/source/Ice/TurnConnection.h
++++ b/src/source/Ice/TurnConnection.h
+@@ -35,7 +35,7 @@ extern "C" {
+ #define DEFAULT_TURN_MESSAGE_SEND_CHANNEL_DATA_BUFFER_LEN MAX_TURN_CHANNEL_DATA_MESSAGE_SIZE
+ #define DEFAULT_TURN_MESSAGE_RECV_CHANNEL_DATA_BUFFER_LEN MAX_TURN_CHANNEL_DATA_MESSAGE_SIZE
+ #define DEFAULT_TURN_CHANNEL_DATA_BUFFER_SIZE             512
+-#define DEFAULT_TURN_MAX_PEER_COUNT                       32
++#define DEFAULT_TURN_MAX_PEER_COUNT                       128
+ 
+ // all turn channel numbers must be greater than 0x4000 and less than 0x7FFF
+ #define TURN_CHANNEL_BIND_CHANNEL_NUMBER_BASE (UINT16) 0x4000
+diff --git a/src/source/Metrics/Metrics.c b/src/source/Metrics/Metrics.c
+index f39c3e029..47e59392e 100644
+--- a/src/source/Metrics/Metrics.c
++++ b/src/source/Metrics/Metrics.c
+@@ -127,7 +127,7 @@ STATUS getRtpRemoteInboundStats(PRtcPeerConnection pRtcPeerConnection, PRtcRtpTr
+         CHK(pKvsRtpTransceiver != NULL, STATUS_NOT_FOUND);
+     }
+     // check if specified transceiver belongs to this connection
+-    CHK_STATUS(hasTransceiverWithSsrc(pKvsPeerConnection, pKvsRtpTransceiver->sender.ssrc));
++    CHK_STATUS(hasTransceiverWithSsrc(pKvsPeerConnection, pKvsRtpTransceiver->sender[0].ssrc));
+     MUTEX_LOCK(pKvsRtpTransceiver->statsLock);
+     *pRtcRemoteInboundRtpStreamStats = pKvsRtpTransceiver->remoteInboundStats;
+     MUTEX_UNLOCK(pKvsRtpTransceiver->statsLock);
+@@ -151,7 +151,7 @@ STATUS getRtpOutboundStats(PRtcPeerConnection pRtcPeerConnection, PRtcRtpTransce
+         CHK(pKvsRtpTransceiver != NULL, STATUS_NOT_FOUND);
+     }
+     // check if specified transceiver belongs to this connection
+-    CHK_STATUS(hasTransceiverWithSsrc(pKvsPeerConnection, pKvsRtpTransceiver->sender.ssrc));
++    CHK_STATUS(hasTransceiverWithSsrc(pKvsPeerConnection, pKvsRtpTransceiver->sender[0].ssrc));
+     MUTEX_LOCK(pKvsRtpTransceiver->statsLock);
+     *pRtcOutboundRtpStreamStats = pKvsRtpTransceiver->outboundStats;
+     MUTEX_UNLOCK(pKvsRtpTransceiver->statsLock);
+diff --git a/src/source/PeerConnection/PeerConnection.c b/src/source/PeerConnection/PeerConnection.c
+index 3e4de6823..42c1a4a94 100644
+--- a/src/source/PeerConnection/PeerConnection.c
++++ b/src/source/PeerConnection/PeerConnection.c
+@@ -615,20 +615,20 @@ STATUS rtcpReportsCallback(UINT32 timerId, UINT64 currentTime, UINT64 customData
+     CHK(pKvsRtpTransceiver != NULL && pKvsRtpTransceiver->pJitterBuffer != NULL && pKvsRtpTransceiver->pKvsPeerConnection != NULL, STATUS_NULL_ARG);
+     pKvsPeerConnection = pKvsRtpTransceiver->pKvsPeerConnection;
+ 
+-    ssrc = pKvsRtpTransceiver->sender.ssrc;
+-    DLOGS("rtcpReportsCallback %" PRIu64 " ssrc: %u rtxssrc: %u", currentTime, ssrc, pKvsRtpTransceiver->sender.rtxSsrc);
++    ssrc = pKvsRtpTransceiver->sender[0].ssrc;
++    DLOGS("rtcpReportsCallback %" PRIu64 " ssrc: %u rtxssrc: %u", currentTime, ssrc, pKvsRtpTransceiver->sender[0].rtxSsrc);
+ 
+     // check if ice agent is connected, reschedule in 200msec if not
+     ready = pKvsPeerConnection->pSrtpSession != NULL &&
+-        currentTime - pKvsRtpTransceiver->sender.firstFrameWallClockTime >= 2500 * HUNDREDS_OF_NANOS_IN_A_MILLISECOND;
++        currentTime - pKvsRtpTransceiver->sender[0].firstFrameWallClockTime >= 2500 * HUNDREDS_OF_NANOS_IN_A_MILLISECOND;
+     if (!ready) {
+         DLOGV("sender report no frames sent %u", ssrc);
+     } else {
+         // create rtcp sender report packet
+         // https://tools.ietf.org/html/rfc3550#section-6.4.1
+         ntpTime = convertTimestampToNTP(currentTime);
+-        rtpTime = pKvsRtpTransceiver->sender.rtpTimeOffset +
+-            CONVERT_TIMESTAMP_TO_RTP(pKvsRtpTransceiver->pJitterBuffer->clockRate, currentTime - pKvsRtpTransceiver->sender.firstFrameWallClockTime);
++        rtpTime = pKvsRtpTransceiver->sender[0].rtpTimeOffset +
++            CONVERT_TIMESTAMP_TO_RTP(pKvsRtpTransceiver->pJitterBuffer->clockRate, currentTime - pKvsRtpTransceiver->sender[0].firstFrameWallClockTime);
+         MUTEX_LOCK(pKvsRtpTransceiver->statsLock);
+         packetCount = pKvsRtpTransceiver->outboundStats.sent.packetsSent;
+         octetCount = pKvsRtpTransceiver->outboundStats.sent.bytesSent;
+@@ -708,6 +708,7 @@ STATUS createPeerConnection(PRtcConfiguration pConfiguration, PRtcPeerConnection
+         ? DEFAULT_MTU_SIZE
+         : pConfiguration->kvsRtcConfiguration.maximumTransmissionUnit;
+     pKvsPeerConnection->sctpIsEnabled = FALSE;
++    pKvsPeerConnection->videoMediaCount = pConfiguration->kvsRtcConfiguration.videoMediaCount;
+ 
+     iceAgentCallbacks.customData = (UINT64) pKvsPeerConnection;
+     iceAgentCallbacks.inboundPacketFn = onInboundPacket;
+@@ -821,7 +822,6 @@ STATUS freePeerConnection(PRtcPeerConnection* ppPeerConnection)
+     SAFE_MEMFREE(*ppPeerConnection);
+ 
+ CleanUp:
+-
+     LEAVES();
+     return retStatus;
+ }
+@@ -973,12 +973,9 @@ STATUS peerConnectionGetCurrentLocalDescription(PRtcPeerConnection pRtcPeerConne
+     CHK(pKvsPeerConnection->remoteSessionDescription.sessionName[0] != '\0', retStatus);
+ 
+     CHK(NULL != (pSessionDescription = (PSessionDescription) MEMCALLOC(1, SIZEOF(SessionDescription))), STATUS_NOT_ENOUGH_MEMORY);
+-
+     CHK_STATUS(populateSessionDescription(pKvsPeerConnection, &(pKvsPeerConnection->remoteSessionDescription), pSessionDescription));
+-
+     CHK_STATUS(serializeSessionDescription(pSessionDescription, NULL, &serializeLen));
+     CHK(serializeLen <= MAX_SESSION_DESCRIPTION_INIT_SDP_LEN, STATUS_NOT_ENOUGH_MEMORY);
+-
+     CHK_STATUS(serializeSessionDescription(pSessionDescription, pRtcSessionDescriptionInit->sdp, &serializeLen));
+ 
+ CleanUp:
+@@ -1338,7 +1335,6 @@ STATUS closePeerConnection(PRtcPeerConnection pPeerConnection)
+ CleanUp:
+ 
+     CHK_LOG_ERR(retStatus);
+-
+     LEAVES();
+     return retStatus;
+ }
+diff --git a/src/source/PeerConnection/PeerConnection.h b/src/source/PeerConnection/PeerConnection.h
+index cc48b5b7e..3a2e6da1e 100644
+--- a/src/source/PeerConnection/PeerConnection.h
++++ b/src/source/PeerConnection/PeerConnection.h
+@@ -128,6 +128,7 @@ typedef struct {
+     PTwccManager pTwccManager;
+     RtcOnSenderBandwidthEstimation onSenderBandwidthEstimation;
+     UINT64 onSenderBandwidthEstimationCustomData;
++    UINT32 videoMediaCount;
+ } KvsPeerConnection, *PKvsPeerConnection;
+ 
+ typedef struct {
+diff --git a/src/source/PeerConnection/Retransmitter.c b/src/source/PeerConnection/Retransmitter.c
+index b8b66a483..192d350ad 100644
+--- a/src/source/PeerConnection/Retransmitter.c
++++ b/src/source/PeerConnection/Retransmitter.c
+@@ -52,6 +52,7 @@ STATUS resendPacketOnNack(PRtcpPacket pRtcpPacket, PKvsPeerConnection pKvsPeerCo
+     STATUS tmpStatus = STATUS_SUCCESS;
+     PRtpPacket pRtpPacket = NULL, pRtxRtpPacket = NULL;
+     PRetransmitter pRetransmitter = NULL;
++    UINT32 trackId;
+     // stats
+     UINT32 retransmittedPacketsSent = 0, retransmittedBytesSent = 0, nackCount = 0;
+ 
+@@ -65,7 +66,8 @@ STATUS resendPacketOnNack(PRtcpPacket pRtcpPacket, PKvsPeerConnection pKvsPeerCo
+     }
+     CHK_STATUS(tmpStatus);
+ 
+-    pRetransmitter = pSenderTranceiver->sender.retransmitter;
++    trackId = receiverSsrc - pSenderTranceiver->sender[0].ssrc;
++    pRetransmitter = pSenderTranceiver->sender[trackId].retransmitter;
+     // TODO it is not very clear from the spec whether nackCount is number of packets received or number of rtp packets lost reported in nack packets
+     nackCount++;
+ 
+@@ -76,21 +78,21 @@ STATUS resendPacketOnNack(PRtcpPacket pRtcpPacket, PKvsPeerConnection pKvsPeerCo
+     CHK_STATUS(rtcpNackListGet(pRtcpPacket->payload, pRtcpPacket->payloadLength, &senderSsrc, &receiverSsrc, pRetransmitter->sequenceNumberList,
+                                &filledLen));
+     validIndexListLen = pRetransmitter->validIndexListLen;
+-    CHK_STATUS(rtpRollingBufferGetValidSeqIndexList(pSenderTranceiver->sender.packetBuffer, pRetransmitter->sequenceNumberList, filledLen,
++    CHK_STATUS(rtpRollingBufferGetValidSeqIndexList(pSenderTranceiver->sender[trackId].packetBuffer, pRetransmitter->sequenceNumberList, filledLen,
+                                                     pRetransmitter->validIndexList, &validIndexListLen));
+     for (index = 0; index < validIndexListLen; index++) {
+-        retStatus = rollingBufferExtractData(pSenderTranceiver->sender.packetBuffer->pRollingBuffer, pRetransmitter->validIndexList[index], &item);
++        retStatus = rollingBufferExtractData(pSenderTranceiver->sender[trackId].packetBuffer->pRollingBuffer, pRetransmitter->validIndexList[index], &item);
+         pRtpPacket = (PRtpPacket) item;
+         CHK(retStatus == STATUS_SUCCESS, retStatus);
+ 
+         if (pRtpPacket != NULL) {
+-            if (pSenderTranceiver->sender.payloadType == pSenderTranceiver->sender.rtxPayloadType) {
++            if (pSenderTranceiver->sender[trackId].payloadType == pSenderTranceiver->sender[trackId].rtxPayloadType) {
+                 retStatus = iceAgentSendPacket(pKvsPeerConnection->pIceAgent, pRtpPacket->pRawPacket, pRtpPacket->rawPacketLength);
+             } else {
+                 CHK_STATUS(constructRetransmitRtpPacketFromBytes(
+-                    pRtpPacket->pRawPacket, pRtpPacket->rawPacketLength, pSenderTranceiver->sender.rtxSequenceNumber,
+-                    pSenderTranceiver->sender.rtxPayloadType, pSenderTranceiver->sender.rtxSsrc, &pRtxRtpPacket));
+-                pSenderTranceiver->sender.rtxSequenceNumber++;
++                    pRtpPacket->pRawPacket, pRtpPacket->rawPacketLength, pSenderTranceiver->sender[trackId].rtxSequenceNumber,
++                    pSenderTranceiver->sender[trackId].rtxPayloadType, pSenderTranceiver->sender[trackId].rtxSsrc, &pRtxRtpPacket));
++                pSenderTranceiver->sender[trackId].rtxSequenceNumber++;
+                 retStatus = writeRtpPacket(pKvsPeerConnection, pRtxRtpPacket);
+             }
+             // resendPacket
+@@ -105,7 +107,7 @@ STATUS resendPacketOnNack(PRtcpPacket pRtcpPacket, PKvsPeerConnection pKvsPeerCo
+             }
+             // putBackPacketToRollingBuffer
+             retStatus =
+-                rollingBufferInsertData(pSenderTranceiver->sender.packetBuffer->pRollingBuffer, pRetransmitter->sequenceNumberList[index], item);
++                rollingBufferInsertData(pSenderTranceiver->sender[trackId].packetBuffer->pRollingBuffer, pRetransmitter->sequenceNumberList[index], item);
+             CHK(retStatus == STATUS_SUCCESS || retStatus == STATUS_ROLLING_BUFFER_NOT_IN_RANGE, retStatus);
+ 
+             // free the packet if it is not in the valid range any more
+diff --git a/src/source/PeerConnection/Rtp.c b/src/source/PeerConnection/Rtp.c
+index e4c35b67e..0ac7dcd4d 100644
+--- a/src/source/PeerConnection/Rtp.c
++++ b/src/source/PeerConnection/Rtp.c
+@@ -10,6 +10,8 @@ STATUS createKvsRtpTransceiver(RTC_RTP_TRANSCEIVER_DIRECTION direction, PKvsPeer
+ {
+     STATUS retStatus = STATUS_SUCCESS;
+     PKvsRtpTransceiver pKvsRtpTransceiver = NULL;
++    UINT32 i;
++    PRtcMediaStreamTrack pTrack;
+ 
+     CHK(ppKvsRtpTransceiver != NULL && pKvsPeerConnection != NULL && pRtcMediaStreamTrack != NULL, STATUS_NULL_ARG);
+ 
+@@ -21,11 +23,16 @@ STATUS createKvsRtpTransceiver(RTC_RTP_TRANSCEIVER_DIRECTION direction, PKvsPeer
+     CHK(pKvsRtpTransceiver->peerFrameBuffer != NULL, STATUS_NOT_ENOUGH_MEMORY);
+     pKvsRtpTransceiver->pKvsPeerConnection = pKvsPeerConnection;
+     pKvsRtpTransceiver->statsLock = MUTEX_CREATE(FALSE);
+-    pKvsRtpTransceiver->sender.ssrc = ssrc;
+-    pKvsRtpTransceiver->sender.rtxSsrc = rtxSsrc;
+-    pKvsRtpTransceiver->sender.track = *pRtcMediaStreamTrack;
+-    pKvsRtpTransceiver->sender.packetBuffer = NULL;
+-    pKvsRtpTransceiver->sender.retransmitter = NULL;
++    for (i = 0; i < MAX_VIDEO_CHANNEL_PER_TRANSCEIVER; i++) {
++        pKvsRtpTransceiver->sender[i].ssrc = ssrc + i;
++        pKvsRtpTransceiver->sender[i].rtxSsrc = rtxSsrc + i;
++        pKvsRtpTransceiver->sender[i].track = *pRtcMediaStreamTrack;
++        pTrack = &pKvsRtpTransceiver->sender[i].track;
++        sprintf(pTrack->trackId, "%s%02d", pTrack->trackId, i);
++        pKvsRtpTransceiver->sender[i].packetBuffer = NULL;
++        pKvsRtpTransceiver->sender[i].retransmitter = NULL;
++    }
++
+     pKvsRtpTransceiver->pJitterBuffer = pJitterBuffer;
+     pKvsRtpTransceiver->transceiver.receiver.track.codec = rtcCodec;
+     pKvsRtpTransceiver->transceiver.receiver.track.kind = pRtcMediaStreamTrack->kind;
+@@ -59,6 +66,7 @@ STATUS freeKvsRtpTransceiver(PKvsRtpTransceiver* ppKvsRtpTransceiver)
+ {
+     STATUS retStatus = STATUS_SUCCESS;
+     PKvsRtpTransceiver pKvsRtpTransceiver = NULL;
++    UINT32 i;
+ 
+     CHK(ppKvsRtpTransceiver != NULL, STATUS_NULL_ARG);
+     pKvsRtpTransceiver = *ppKvsRtpTransceiver;
+@@ -69,19 +77,22 @@ STATUS freeKvsRtpTransceiver(PKvsRtpTransceiver* ppKvsRtpTransceiver)
+         freeJitterBuffer(&pKvsRtpTransceiver->pJitterBuffer);
+     }
+ 
+-    if (pKvsRtpTransceiver->sender.packetBuffer != NULL) {
+-        freeRtpRollingBuffer(&pKvsRtpTransceiver->sender.packetBuffer);
+-    }
++    for (i = 0; i < MAX_VIDEO_CHANNEL_PER_TRANSCEIVER; i++) {
++        if (pKvsRtpTransceiver->sender[i].packetBuffer != NULL) {
++            freeRtpRollingBuffer(&pKvsRtpTransceiver->sender[i].packetBuffer);
++        }
+ 
+-    if (pKvsRtpTransceiver->sender.retransmitter != NULL) {
+-        freeRetransmitter(&pKvsRtpTransceiver->sender.retransmitter);
++        if (pKvsRtpTransceiver->sender[i].retransmitter != NULL) {
++            freeRetransmitter(&pKvsRtpTransceiver->sender[i].retransmitter);
++        }
+     }
+     MUTEX_FREE(pKvsRtpTransceiver->statsLock);
+ 
+     SAFE_MEMFREE(pKvsRtpTransceiver->peerFrameBuffer);
+-    SAFE_MEMFREE(pKvsRtpTransceiver->sender.payloadArray.payloadBuffer);
+-    SAFE_MEMFREE(pKvsRtpTransceiver->sender.payloadArray.payloadSubLength);
+-
++    for ( i = 0; i < MAX_VIDEO_CHANNEL_PER_TRANSCEIVER; i++) {
++        SAFE_MEMFREE(pKvsRtpTransceiver->sender[i].payloadArray.payloadBuffer);
++        SAFE_MEMFREE(pKvsRtpTransceiver->sender[i].payloadArray.payloadSubLength);
++    }
+     SAFE_MEMFREE(pKvsRtpTransceiver);
+ 
+     *ppKvsRtpTransceiver = NULL;
+@@ -181,7 +192,7 @@ CleanUp:
+     return retStatus;
+ }
+ 
+-STATUS writeFrame(PRtcRtpTransceiver pRtcRtpTransceiver, PFrame pFrame)
++STATUS writeFrame(PRtcRtpTransceiver pRtcRtpTransceiver, PFrame pFrame, UINT32 trackNum)
+ {
+     STATUS retStatus = STATUS_SUCCESS;
+     PKvsPeerConnection pKvsPeerConnection = NULL;
+@@ -210,18 +221,18 @@ STATUS writeFrame(PRtcRtpTransceiver pRtcRtpTransceiver, PFrame pFrame)
+ 
+     CHK(pKvsRtpTransceiver != NULL && pFrame != NULL, STATUS_NULL_ARG);
+     pKvsPeerConnection = pKvsRtpTransceiver->pKvsPeerConnection;
+-    pPayloadArray = &(pKvsRtpTransceiver->sender.payloadArray);
+-    if (MEDIA_STREAM_TRACK_KIND_VIDEO == pKvsRtpTransceiver->sender.track.kind) {
++    pPayloadArray = &(pKvsRtpTransceiver->sender[trackNum].payloadArray);
++    if (MEDIA_STREAM_TRACK_KIND_VIDEO == pKvsRtpTransceiver->sender[trackNum].track.kind) {
+         frames++;
+         if (0 != (pFrame->flags & FRAME_FLAG_KEY_FRAME)) {
+             keyframes++;
+         }
+-        if (pKvsRtpTransceiver->sender.lastKnownFrameCountTime == 0) {
+-            pKvsRtpTransceiver->sender.lastKnownFrameCountTime = now;
+-            pKvsRtpTransceiver->sender.lastKnownFrameCount = pKvsRtpTransceiver->outboundStats.framesEncoded + frames;
+-        } else if (now - pKvsRtpTransceiver->sender.lastKnownFrameCountTime > HUNDREDS_OF_NANOS_IN_A_SECOND) {
+-            tmpFrames = (pKvsRtpTransceiver->outboundStats.framesEncoded + frames) - pKvsRtpTransceiver->sender.lastKnownFrameCount;
+-            tmpTime = now - pKvsRtpTransceiver->sender.lastKnownFrameCountTime;
++        if (pKvsRtpTransceiver->sender[trackNum].lastKnownFrameCountTime == 0) {
++            pKvsRtpTransceiver->sender[trackNum].lastKnownFrameCountTime = now;
++            pKvsRtpTransceiver->sender[trackNum].lastKnownFrameCount = pKvsRtpTransceiver->outboundStats.framesEncoded + frames;
++        } else if (now - pKvsRtpTransceiver->sender[trackNum].lastKnownFrameCountTime > HUNDREDS_OF_NANOS_IN_A_SECOND) {
++            tmpFrames = (pKvsRtpTransceiver->outboundStats.framesEncoded + frames) - pKvsRtpTransceiver->sender[trackNum].lastKnownFrameCount;
++            tmpTime = now - pKvsRtpTransceiver->sender[trackNum].lastKnownFrameCountTime;
+             fps = (DOUBLE) (tmpFrames * HUNDREDS_OF_NANOS_IN_A_SECOND) / (DOUBLE) tmpTime;
+         }
+     }
+@@ -229,7 +240,7 @@ STATUS writeFrame(PRtcRtpTransceiver pRtcRtpTransceiver, PFrame pFrame)
+     MUTEX_LOCK(pKvsPeerConnection->pSrtpSessionLock);
+     locked = TRUE;
+     CHK(pKvsPeerConnection->pSrtpSession != NULL, STATUS_SRTP_NOT_READY_YET); // Discard packets till SRTP is ready
+-    switch (pKvsRtpTransceiver->sender.track.codec) {
++    switch (pKvsRtpTransceiver->sender[trackNum].track.codec) {
+         case RTC_CODEC_H264_PROFILE_42E01F_LEVEL_ASYMMETRY_ALLOWED_PACKETIZATION_MODE:
+             rtpPayloadFunc = createPayloadForH264;
+             rtpTimestamp = CONVERT_TIMESTAMP_TO_RTP(VIDEO_CLOCKRATE, pFrame->presentationTs);
+@@ -273,11 +284,11 @@ STATUS writeFrame(PRtcRtpTransceiver pRtcRtpTransceiver, PFrame pFrame)
+                               &(pPayloadArray->payloadLength), pPayloadArray->payloadSubLength, &(pPayloadArray->payloadSubLenSize)));
+     pPacketList = (PRtpPacket) MEMALLOC(pPayloadArray->payloadSubLenSize * SIZEOF(RtpPacket));
+ 
+-    CHK_STATUS(constructRtpPackets(pPayloadArray, pKvsRtpTransceiver->sender.payloadType, pKvsRtpTransceiver->sender.sequenceNumber, rtpTimestamp,
+-                                   pKvsRtpTransceiver->sender.ssrc, pPacketList, pPayloadArray->payloadSubLenSize));
+-    pKvsRtpTransceiver->sender.sequenceNumber = GET_UINT16_SEQ_NUM(pKvsRtpTransceiver->sender.sequenceNumber + pPayloadArray->payloadSubLenSize);
++    CHK_STATUS(constructRtpPackets(pPayloadArray, pKvsRtpTransceiver->sender[trackNum].payloadType, pKvsRtpTransceiver->sender[trackNum].sequenceNumber, rtpTimestamp,
++                                   pKvsRtpTransceiver->sender[trackNum].ssrc, pPacketList, pPayloadArray->payloadSubLenSize));
++    pKvsRtpTransceiver->sender[trackNum].sequenceNumber = GET_UINT16_SEQ_NUM(pKvsRtpTransceiver->sender[trackNum].sequenceNumber + pPayloadArray->payloadSubLenSize);
+ 
+-    bufferAfterEncrypt = (pKvsRtpTransceiver->sender.payloadType == pKvsRtpTransceiver->sender.rtxPayloadType);
++    bufferAfterEncrypt = (pKvsRtpTransceiver->sender[trackNum].payloadType == pKvsRtpTransceiver->sender[trackNum].rtxPayloadType);
+     for (i = 0; i < pPayloadArray->payloadSubLenSize; i++) {
+         pRtpPacket = pPacketList + i;
+         if (pKvsRtpTransceiver->pKvsPeerConnection->twccExtId != 0) {
+@@ -299,7 +310,7 @@ STATUS writeFrame(PRtcRtpTransceiver pRtcRtpTransceiver, PFrame pFrame)
+         if (!bufferAfterEncrypt) {
+             pRtpPacket->pRawPacket = rawPacket;
+             pRtpPacket->rawPacketLength = packetLen;
+-            CHK_STATUS(rtpRollingBufferAddRtpPacket(pKvsRtpTransceiver->sender.packetBuffer, pRtpPacket));
++            CHK_STATUS(rtpRollingBufferAddRtpPacket(pKvsRtpTransceiver->sender[trackNum].packetBuffer, pRtpPacket));
+         }
+ 
+         CHK_STATUS(encryptRtpPacket(pKvsPeerConnection->pSrtpSession, rawPacket, (PINT32) &packetLen));
+@@ -319,7 +330,7 @@ STATUS writeFrame(PRtcRtpTransceiver pRtcRtpTransceiver, PFrame pFrame)
+         if (bufferAfterEncrypt) {
+             pRtpPacket->pRawPacket = rawPacket;
+             pRtpPacket->rawPacketLength = packetLen;
+-            CHK_STATUS(rtpRollingBufferAddRtpPacket(pKvsRtpTransceiver->sender.packetBuffer, pRtpPacket));
++            CHK_STATUS(rtpRollingBufferAddRtpPacket(pKvsRtpTransceiver->sender[trackNum].packetBuffer, pRtpPacket));
+         }
+ 
+         // https://tools.ietf.org/html/rfc3550#section-6.4.1
+@@ -332,14 +343,13 @@ STATUS writeFrame(PRtcRtpTransceiver pRtcRtpTransceiver, PFrame pFrame)
+ 
+         SAFE_MEMFREE(rawPacket);
+     }
+-
+-    if (MEDIA_STREAM_TRACK_KIND_VIDEO == pKvsRtpTransceiver->sender.track.kind) {
++if (MEDIA_STREAM_TRACK_KIND_VIDEO == pKvsRtpTransceiver->sender[trackNum].track.kind) {
+         framesSent++;
+     }
+ 
+-    if (pKvsRtpTransceiver->sender.firstFrameWallClockTime == 0) {
+-        pKvsRtpTransceiver->sender.rtpTimeOffset = randomRtpTimeoffset;
+-        pKvsRtpTransceiver->sender.firstFrameWallClockTime = now;
++    if (pKvsRtpTransceiver->sender[trackNum].firstFrameWallClockTime == 0) {
++        pKvsRtpTransceiver->sender[trackNum].rtpTimeOffset = randomRtpTimeoffset;
++        pKvsRtpTransceiver->sender[trackNum].firstFrameWallClockTime = now;
+     }
+ 
+ CleanUp:
+@@ -353,8 +363,8 @@ CleanUp:
+     if (fps > 0.0) {
+         pKvsRtpTransceiver->outboundStats.framesPerSecond = fps;
+     }
+-    pKvsRtpTransceiver->sender.lastKnownFrameCountTime = now;
+-    pKvsRtpTransceiver->sender.lastKnownFrameCount = pKvsRtpTransceiver->outboundStats.framesEncoded;
++    pKvsRtpTransceiver->sender[trackNum].lastKnownFrameCountTime = now;
++    pKvsRtpTransceiver->sender[trackNum].lastKnownFrameCount = pKvsRtpTransceiver->outboundStats.framesEncoded;
+     pKvsRtpTransceiver->outboundStats.sent.bytesSent += bytesSent;
+     pKvsRtpTransceiver->outboundStats.sent.packetsSent += packetsSent;
+     if (lastPacketSentTimestamp > 0) {
+@@ -424,17 +434,25 @@ STATUS findTransceiverBySsrc(PKvsPeerConnection pKvsPeerConnection, PKvsRtpTrans
+     PDoubleListNode pCurNode = NULL;
+     UINT64 item = 0;
+     PKvsRtpTransceiver pTransceiver = NULL;
++    UINT32 i;
++
+     CHK(pKvsPeerConnection != NULL && ppTransceiver != NULL, STATUS_NULL_ARG);
+ 
+     CHK_STATUS(doubleListGetHeadNode(pKvsPeerConnection->pTransceivers, &pCurNode));
+     while (pCurNode != NULL) {
+         CHK_STATUS(doubleListGetNodeData(pCurNode, &item));
+         pTransceiver = (PKvsRtpTransceiver) item;
+-        if (pTransceiver->sender.ssrc == ssrc || pTransceiver->sender.rtxSsrc == ssrc || pTransceiver->jitterBufferSsrc == ssrc) {
++        for (i = 0; i < MAX_VIDEO_CHANNEL_PER_TRANSCEIVER; i++) {
++            if (pTransceiver->sender[i].ssrc == ssrc || pTransceiver->sender[i].rtxSsrc == ssrc || pTransceiver->jitterBufferSsrc == ssrc) {
++                break;
++            }
++        }
++        if (i == MAX_VIDEO_CHANNEL_PER_TRANSCEIVER) {
++            pTransceiver = NULL;
++            pCurNode = pCurNode->pNext;
++        } else {
+             break;
+         }
+-        pTransceiver = NULL;
+-        pCurNode = pCurNode->pNext;
+     }
+     CHK(pTransceiver != NULL, STATUS_NOT_FOUND);
+     *ppTransceiver = pTransceiver;
+diff --git a/src/source/PeerConnection/Rtp.h b/src/source/PeerConnection/Rtp.h
+index d9104d73e..dd84c96f5 100644
+--- a/src/source/PeerConnection/Rtp.h
++++ b/src/source/PeerConnection/Rtp.h
+@@ -12,11 +12,13 @@ extern "C" {
+ #define DEFAULT_MTU_SIZE                           1200
+ #define DEFAULT_ROLLING_BUFFER_DURATION_IN_SECONDS 3
+ #define HIGHEST_EXPECTED_BIT_RATE                  (10 * 1024 * 1024)
+-#define DEFAULT_SEQ_NUM_BUFFER_SIZE                1000
+-#define DEFAULT_VALID_INDEX_BUFFER_SIZE            1000
+-#define DEFAULT_PEER_FRAME_BUFFER_SIZE             (5 * 1024)
++#define DEFAULT_SEQ_NUM_BUFFER_SIZE                1024
++#define DEFAULT_VALID_INDEX_BUFFER_SIZE            1024
++#define DEFAULT_PEER_FRAME_BUFFER_SIZE             (2 * 1024)
+ #define SRTP_AUTH_TAG_OVERHEAD                     10
+ 
++#define MAX_VIDEO_CHANNEL_PER_TRANSCEIVER 17
++
+ // https://www.w3.org/TR/webrtc-stats/#dom-rtcoutboundrtpstreamstats-huge
+ // Huge frames, by definition, are frames that have an encoded size at least 2.5 times the average size of the frames.
+ #define HUGE_FRAME_MULTIPLIER 2.5
+@@ -45,7 +47,7 @@ typedef struct {
+ 
+ typedef struct {
+     RtcRtpTransceiver transceiver;
+-    RtcRtpSender sender;
++    RtcRtpSender sender[MAX_VIDEO_CHANNEL_PER_TRANSCEIVER];
+ 
+     PKvsPeerConnection pKvsPeerConnection;
+ 
+diff --git a/src/source/PeerConnection/SessionDescription.c b/src/source/PeerConnection/SessionDescription.c
+index cab1eb066..e3311b745 100644
+--- a/src/source/PeerConnection/SessionDescription.c
++++ b/src/source/PeerConnection/SessionDescription.c
+@@ -1,6 +1,8 @@
+ #define LOG_CLASS "SessionDescription"
+ #include "../Include_i.h"
+ 
++#define VIDEO_MEDIA_COUNT 8
++
+ STATUS serializeSessionDescriptionInit(PRtcSessionDescriptionInit pSessionDescriptionInit, PCHAR sessionDescriptionJSON,
+                                        PUINT32 sessionDescriptionJSONLen)
+ {
+@@ -273,6 +275,7 @@ STATUS setTransceiverPayloadTypes(PHashTable codecTable, PHashTable rtxTable, PD
+     PDoubleListNode pCurNode = NULL;
+     PKvsRtpTransceiver pKvsRtpTransceiver;
+     UINT64 data;
++    UINT32 i;
+ 
+     // Loop over Transceivers and set the payloadType (which what we got from the other side)
+     // If a codec we want to send wasn't supported by the other return an error
+@@ -285,19 +288,23 @@ STATUS setTransceiverPayloadTypes(PHashTable codecTable, PHashTable rtxTable, PD
+         if (pKvsRtpTransceiver != NULL &&
+             (pKvsRtpTransceiver->transceiver.direction == RTC_RTP_TRANSCEIVER_DIRECTION_SENDRECV ||
+              pKvsRtpTransceiver->transceiver.direction == RTC_RTP_TRANSCEIVER_DIRECTION_SENDONLY)) {
+-            CHK_STATUS(hashTableGet(codecTable, pKvsRtpTransceiver->sender.track.codec, &data));
+-            pKvsRtpTransceiver->sender.payloadType = (UINT8) data;
+-            pKvsRtpTransceiver->sender.rtxPayloadType = (UINT8) data;
+-
+-            // NACKs may have distinct PayloadTypes, look in the rtxTable and check. Otherwise NACKs will just be re-sending the same seqnum
+-            if (hashTableGet(rtxTable, pKvsRtpTransceiver->sender.track.codec, &data) == STATUS_SUCCESS) {
+-                pKvsRtpTransceiver->sender.rtxPayloadType = (UINT8) data;
++            for (i = 0; i < MAX_VIDEO_CHANNEL_PER_TRANSCEIVER; i++) {
++                CHK_STATUS(hashTableGet(codecTable, pKvsRtpTransceiver->sender[i].track.codec, &data));
++                pKvsRtpTransceiver->sender[i].payloadType = (UINT8) data;
++                pKvsRtpTransceiver->sender[i].rtxPayloadType = (UINT8) data;
++
++                // NACKs may have distinct PayloadTypes, look in the rtxTable and check. Otherwise NACKs will just be re-sending the same seqnum
++                if (hashTableGet(rtxTable, pKvsRtpTransceiver->sender[i].track.codec, &data) == STATUS_SUCCESS) {
++                    pKvsRtpTransceiver->sender[i].rtxPayloadType = (UINT8) data;
++                }
+             }
+         }
+ 
+-        CHK_STATUS(createRtpRollingBuffer(DEFAULT_ROLLING_BUFFER_DURATION_IN_SECONDS * HIGHEST_EXPECTED_BIT_RATE / 8 / DEFAULT_MTU_SIZE,
+-                                          &pKvsRtpTransceiver->sender.packetBuffer));
+-        CHK_STATUS(createRetransmitter(DEFAULT_SEQ_NUM_BUFFER_SIZE, DEFAULT_VALID_INDEX_BUFFER_SIZE, &pKvsRtpTransceiver->sender.retransmitter));
++        for ( i = 0; i < MAX_VIDEO_CHANNEL_PER_TRANSCEIVER; i++) {
++            CHK_STATUS(createRtpRollingBuffer(DEFAULT_ROLLING_BUFFER_DURATION_IN_SECONDS * HIGHEST_EXPECTED_BIT_RATE / 8 / DEFAULT_MTU_SIZE,
++                                            &pKvsRtpTransceiver->sender[i].packetBuffer));
++            CHK_STATUS(createRetransmitter(DEFAULT_SEQ_NUM_BUFFER_SIZE, DEFAULT_VALID_INDEX_BUFFER_SIZE, &pKvsRtpTransceiver->sender[i].retransmitter));
++        }
+     }
+ 
+ CleanUp:
+@@ -395,10 +402,16 @@ STATUS populateSingleMediaSection(PKvsPeerConnection pKvsPeerConnection, PKvsRtp
+     BOOL containRtx = FALSE;
+     BOOL directionFound = FALSE;
+     UINT32 i, remoteAttributeCount, attributeCount = 0;
+-    PRtcMediaStreamTrack pRtcMediaStreamTrack = &(pKvsRtpTransceiver->sender.track);
++    PRtcMediaStreamTrack pRtcMediaStreamTrack;
+     PSdpMediaDescription pSdpMediaDescriptionRemote;
+     PCHAR currentFmtp = NULL;
+ 
++    if (pKvsRtpTransceiver->transceiver.receiver.track.kind == MEDIA_STREAM_TRACK_KIND_VIDEO) {
++        pRtcMediaStreamTrack = &(pKvsRtpTransceiver->sender[mediaSectionId].track);
++    } else {
++        pRtcMediaStreamTrack = &(pKvsRtpTransceiver->sender[0].track);
++    }
++
+     CHK_STATUS(hashTableGet(pKvsPeerConnection->pCodecTable, pRtcMediaStreamTrack->codec, &payloadType));
+     currentFmtp = fmtpForPayloadType(payloadType, &(pKvsPeerConnection->remoteSessionDescription));
+ 
+@@ -425,7 +438,6 @@ STATUS populateSingleMediaSection(PKvsPeerConnection pKvsPeerConnection, PKvsRtp
+ 
+     CHK_STATUS(iceAgentPopulateSdpMediaDescriptionCandidates(pKvsPeerConnection->pIceAgent, pSdpMediaDescription, MAX_SDP_ATTRIBUTE_VALUE_LENGTH,
+                                                              &attributeCount));
+-
+     if (containRtx) {
+         STRCPY(pSdpMediaDescription->sdpAttributes[attributeCount].attributeName, "msid");
+         SPRINTF(pSdpMediaDescription->sdpAttributes[attributeCount].attributeValue, "%s %sRTX", pRtcMediaStreamTrack->streamId,
+@@ -433,54 +445,54 @@ STATUS populateSingleMediaSection(PKvsPeerConnection pKvsPeerConnection, PKvsRtp
+         attributeCount++;
+ 
+         STRCPY(pSdpMediaDescription->sdpAttributes[attributeCount].attributeName, "ssrc-group");
+-        SPRINTF(pSdpMediaDescription->sdpAttributes[attributeCount].attributeValue, "FID %u %u", pKvsRtpTransceiver->sender.ssrc,
+-                pKvsRtpTransceiver->sender.rtxSsrc);
++        SPRINTF(pSdpMediaDescription->sdpAttributes[attributeCount].attributeValue, "FID %u %u", pKvsRtpTransceiver->sender[mediaSectionId].ssrc,
++                pKvsRtpTransceiver->sender[0].rtxSsrc);
+         attributeCount++;
+     } else {
+         STRCPY(pSdpMediaDescription->sdpAttributes[attributeCount].attributeName, "msid");
+-        SPRINTF(pSdpMediaDescription->sdpAttributes[attributeCount].attributeValue, "%s %s", pRtcMediaStreamTrack->streamId,
+-                pRtcMediaStreamTrack->trackId);
++        SPRINTF(pSdpMediaDescription->sdpAttributes[attributeCount].attributeValue, "%s_%d %s", pRtcMediaStreamTrack->streamId,
++                mediaSectionId, pRtcMediaStreamTrack->trackId);
+         attributeCount++;
+     }
+ 
+     STRCPY(pSdpMediaDescription->sdpAttributes[attributeCount].attributeName, "ssrc");
+-    SPRINTF(pSdpMediaDescription->sdpAttributes[attributeCount].attributeValue, "%u cname:%s", pKvsRtpTransceiver->sender.ssrc,
++    SPRINTF(pSdpMediaDescription->sdpAttributes[attributeCount].attributeValue, "%u cname:%s", pKvsRtpTransceiver->sender[mediaSectionId].ssrc,
+             pKvsPeerConnection->localCNAME);
+     attributeCount++;
+ 
+     STRCPY(pSdpMediaDescription->sdpAttributes[attributeCount].attributeName, "ssrc");
+-    SPRINTF(pSdpMediaDescription->sdpAttributes[attributeCount].attributeValue, "%u msid:%s %s", pKvsRtpTransceiver->sender.ssrc,
+-            pRtcMediaStreamTrack->streamId, pRtcMediaStreamTrack->trackId);
++    SPRINTF(pSdpMediaDescription->sdpAttributes[attributeCount].attributeValue, "%u msid:%s_%d %s", pKvsRtpTransceiver->sender[mediaSectionId].ssrc,
++            pRtcMediaStreamTrack->streamId, mediaSectionId, pRtcMediaStreamTrack->trackId);
+     attributeCount++;
+ 
+     STRCPY(pSdpMediaDescription->sdpAttributes[attributeCount].attributeName, "ssrc");
+-    SPRINTF(pSdpMediaDescription->sdpAttributes[attributeCount].attributeValue, "%u mslabel:%s", pKvsRtpTransceiver->sender.ssrc,
+-            pRtcMediaStreamTrack->streamId);
++    SPRINTF(pSdpMediaDescription->sdpAttributes[attributeCount].attributeValue, "%u mslabel:%s_%d", pKvsRtpTransceiver->sender[mediaSectionId].ssrc,
++            pRtcMediaStreamTrack->streamId, mediaSectionId);
+     attributeCount++;
+ 
+     STRCPY(pSdpMediaDescription->sdpAttributes[attributeCount].attributeName, "ssrc");
+-    SPRINTF(pSdpMediaDescription->sdpAttributes[attributeCount].attributeValue, "%u label:%s", pKvsRtpTransceiver->sender.ssrc,
++    SPRINTF(pSdpMediaDescription->sdpAttributes[attributeCount].attributeValue, "%u label:%s", pKvsRtpTransceiver->sender[mediaSectionId].ssrc,
+             pRtcMediaStreamTrack->trackId);
+     attributeCount++;
+ 
+     if (containRtx) {
+         STRCPY(pSdpMediaDescription->sdpAttributes[attributeCount].attributeName, "ssrc");
+-        SPRINTF(pSdpMediaDescription->sdpAttributes[attributeCount].attributeValue, "%u cname:%s", pKvsRtpTransceiver->sender.rtxSsrc,
++        SPRINTF(pSdpMediaDescription->sdpAttributes[attributeCount].attributeValue, "%u cname:%s", pKvsRtpTransceiver->sender[mediaSectionId].rtxSsrc,
+                 pKvsPeerConnection->localCNAME);
+         attributeCount++;
+ 
+         STRCPY(pSdpMediaDescription->sdpAttributes[attributeCount].attributeName, "ssrc");
+-        SPRINTF(pSdpMediaDescription->sdpAttributes[attributeCount].attributeValue, "%u msid:%s %sRTX", pKvsRtpTransceiver->sender.rtxSsrc,
++        SPRINTF(pSdpMediaDescription->sdpAttributes[attributeCount].attributeValue, "%u msid:%s %sRTX", pKvsRtpTransceiver->sender[mediaSectionId].rtxSsrc,
+                 pRtcMediaStreamTrack->streamId, pRtcMediaStreamTrack->trackId);
+         attributeCount++;
+ 
+         STRCPY(pSdpMediaDescription->sdpAttributes[attributeCount].attributeName, "ssrc");
+-        SPRINTF(pSdpMediaDescription->sdpAttributes[attributeCount].attributeValue, "%u mslabel:%sRTX", pKvsRtpTransceiver->sender.rtxSsrc,
++        SPRINTF(pSdpMediaDescription->sdpAttributes[attributeCount].attributeValue, "%u mslabel:%sRTX", pKvsRtpTransceiver->sender[mediaSectionId].rtxSsrc,
+                 pRtcMediaStreamTrack->streamId);
+         attributeCount++;
+ 
+         STRCPY(pSdpMediaDescription->sdpAttributes[attributeCount].attributeName, "ssrc");
+-        SPRINTF(pSdpMediaDescription->sdpAttributes[attributeCount].attributeValue, "%u label:%sRTX", pKvsRtpTransceiver->sender.rtxSsrc,
++        SPRINTF(pSdpMediaDescription->sdpAttributes[attributeCount].attributeValue, "%u label:%sRTX", pKvsRtpTransceiver->sender[mediaSectionId].rtxSsrc,
+                 pRtcMediaStreamTrack->trackId);
+         attributeCount++;
+     }
+@@ -694,7 +706,7 @@ BOOL isPresentInRemote(PKvsRtpTransceiver pKvsRtpTransceiver, PSessionDescriptio
+     PCHAR remoteAttributeValue, end;
+     UINT32 remoteTokenLen, i;
+     PSdpMediaDescription pRemoteMediaDescription;
+-    MEDIA_STREAM_TRACK_KIND localTrackKind = pKvsRtpTransceiver->sender.track.kind;
++    MEDIA_STREAM_TRACK_KIND localTrackKind = pKvsRtpTransceiver->sender[0].track.kind;
+     BOOL wasFound = FALSE;
+ 
+     for (i = 0; i < pRemoteSessionDescription->mediaCount && wasFound == FALSE; i++) {
+@@ -728,6 +740,7 @@ BOOL isPresentInRemote(PKvsRtpTransceiver pKvsRtpTransceiver, PSessionDescriptio
+     return wasFound;
+ }
+ 
++
+ // Populate the media sections of a SessionDescription with the current state of the KvsPeerConnection
+ STATUS populateSessionDescriptionMedia(PKvsPeerConnection pKvsPeerConnection, PSessionDescription pRemoteSessionDescription,
+                                        PSessionDescription pLocalSessionDescription)
+@@ -739,6 +752,7 @@ STATUS populateSessionDescriptionMedia(PKvsPeerConnection pKvsPeerConnection, PS
+     UINT64 data;
+     PKvsRtpTransceiver pKvsRtpTransceiver;
+     PCHAR pDtlsRole = NULL;
++    UINT32 i;
+ 
+     CHK_STATUS(dtlsSessionGetLocalCertificateFingerprint(pKvsPeerConnection->pDtlsSession, certificateFingerprint, CERTIFICATE_FINGERPRINT_LENGTH));
+ 
+@@ -755,19 +769,27 @@ STATUS populateSessionDescriptionMedia(PKvsPeerConnection pKvsPeerConnection, PS
+         pCurNode = pCurNode->pNext;
+         pKvsRtpTransceiver = (PKvsRtpTransceiver) data;
+         if (pKvsRtpTransceiver != NULL) {
+-            CHK(pLocalSessionDescription->mediaCount < MAX_SDP_SESSION_MEDIA_COUNT, STATUS_SESSION_DESCRIPTION_MAX_MEDIA_COUNT);
+-
+-            // If generating answer, need to check if Local Description is present in remote -- if not, we don't need to create a local description
+-            // for it or else our Answer will have an extra m-line, for offer the local is the offer itself, don't care about remote
+-            if (pKvsPeerConnection->isOffer || isPresentInRemote(pKvsRtpTransceiver, pRemoteSessionDescription)) {
++            if (pKvsRtpTransceiver->transceiver.receiver.track.kind == MEDIA_STREAM_TRACK_KIND_VIDEO) {
++                for (i = 0; i < pKvsPeerConnection->videoMediaCount; i++) {
++                    CHK(pLocalSessionDescription->mediaCount < MAX_SDP_SESSION_MEDIA_COUNT, STATUS_SESSION_DESCRIPTION_MAX_MEDIA_COUNT);
++
++                    // If generating answer, need to check if Local Description is present in remote -- if not, we don't need to create a local description
++                    // for it or else our Answer will have an extra m-line, for offer the local is the offer itself, don't care about remote
++                    if (pKvsPeerConnection->isOffer || isPresentInRemote(pKvsRtpTransceiver, pRemoteSessionDescription)) {
++                        CHK_STATUS(populateSingleMediaSection(
++                            pKvsPeerConnection, pKvsRtpTransceiver, &(pLocalSessionDescription->mediaDescriptions[pLocalSessionDescription->mediaCount]),
++                            pRemoteSessionDescription, certificateFingerprint, pLocalSessionDescription->mediaCount, pDtlsRole));
++                        pLocalSessionDescription->mediaCount++;
++                    }
++                }
++            } else {
+                 CHK_STATUS(populateSingleMediaSection(
+-                    pKvsPeerConnection, pKvsRtpTransceiver, &(pLocalSessionDescription->mediaDescriptions[pLocalSessionDescription->mediaCount]),
+-                    pRemoteSessionDescription, certificateFingerprint, pLocalSessionDescription->mediaCount, pDtlsRole));
++                pKvsPeerConnection, pKvsRtpTransceiver, &(pLocalSessionDescription->mediaDescriptions[pLocalSessionDescription->mediaCount]),
++                pRemoteSessionDescription, certificateFingerprint, pLocalSessionDescription->mediaCount, pDtlsRole));
+                 pLocalSessionDescription->mediaCount++;
+             }
+         }
+     }
+-
+     if (pKvsPeerConnection->sctpIsEnabled) {
+         CHK(pLocalSessionDescription->mediaCount < MAX_SDP_SESSION_MEDIA_COUNT, STATUS_SESSION_DESCRIPTION_MAX_MEDIA_COUNT);
+         CHK_STATUS(populateSessionDescriptionDataChannel(pKvsPeerConnection,
+@@ -858,7 +880,7 @@ STATUS copyTransceiverWithCodec(PKvsPeerConnection pKvsPeerConnection, RTC_CODEC
+     while (pCurNode != NULL) {
+         CHK_STATUS(doubleListGetNodeData(pCurNode, &data));
+         pKvsRtpTransceiver = (PKvsRtpTransceiver) data;
+-        if (pKvsRtpTransceiver != NULL && pKvsRtpTransceiver->sender.track.codec == rtcCodec) {
++        if (pKvsRtpTransceiver != NULL && pKvsRtpTransceiver->sender[0].track.codec == rtcCodec) {
+             pTargetKvsRtpTransceiver = pKvsRtpTransceiver;
+             doubleListDeleteNode(pKvsPeerConnection->pTransceivers, pCurNode);
+             break;
+@@ -1025,7 +1047,7 @@ STATUS setReceiversSsrc(PSessionDescription pRemoteSessionDescription, PDoubleLi
+                 while (pCurNode != NULL) {
+                     CHK_STATUS(doubleListGetNodeData(pCurNode, &data));
+                     pKvsRtpTransceiver = (PKvsRtpTransceiver) data;
+-                    codec = pKvsRtpTransceiver->sender.track.codec;
++                    codec = pKvsRtpTransceiver->sender[0].track.codec;
+                     isVideoCodec = (codec == RTC_CODEC_VP8 || codec == RTC_CODEC_H264_PROFILE_42E01F_LEVEL_ASYMMETRY_ALLOWED_PACKETIZATION_MODE);
+                     isAudioCodec = (codec == RTC_CODEC_MULAW || codec == RTC_CODEC_ALAW || codec == RTC_CODEC_OPUS);
+ 
+diff --git a/src/source/Sdp/Deserialize.c b/src/source/Sdp/Deserialize.c
+index c67d68414..33b68034f 100644
+--- a/src/source/Sdp/Deserialize.c
++++ b/src/source/Sdp/Deserialize.c
+@@ -76,6 +76,8 @@ STATUS deserializeSessionDescription(PSessionDescription pSessionDescription, PC
+     STATUS retStatus = STATUS_SUCCESS;
+     PCHAR curr, tail, next;
+     UINT32 lineLen;
++
++
+     CHK(sdpBytes != NULL, STATUS_SESSION_DESCRIPTION_INVALID_SESSION_DESCRIPTION);
+ 
+     curr = sdpBytes;
+diff --git a/src/source/Sdp/Sdp.h b/src/source/Sdp/Sdp.h
+index c156e8035..8def12f58 100644
+--- a/src/source/Sdp/Sdp.h
++++ b/src/source/Sdp/Sdp.h
+@@ -72,7 +72,7 @@ extern "C" {
+  *
+  * reserving enough for audio, video, text, application and message for now
+  */
+-#define MAX_SDP_SESSION_MEDIA_COUNT   5
++#define MAX_SDP_SESSION_MEDIA_COUNT   36
+ #define MAX_SDP_MEDIA_BANDWIDTH_COUNT 2
+ 
+ #define MAX_SDP_ATTRIBUTES_COUNT 256
+diff --git a/tst/PeerConnectionFunctionalityTest.cpp b/tst/PeerConnectionFunctionalityTest.cpp
+index 5a5e3ed3d..cc4b0380e 100644
+--- a/tst/PeerConnectionFunctionalityTest.cpp
++++ b/tst/PeerConnectionFunctionalityTest.cpp
+@@ -686,7 +686,7 @@ TEST_F(PeerConnectionFunctionalityTest, noLostFramesAfterConnected)
+ 
+     for (BYTE i = 1; i <= 3; i++) {
+         videoFrame.frameData[0] = i;
+-        EXPECT_EQ(writeFrame(offerVideoTransceiver, &videoFrame), STATUS_SUCCESS);
++        EXPECT_EQ(writeFrame(offerVideoTransceiver, &videoFrame, 0), STATUS_SUCCESS);
+         videoFrame.presentationTs += (HUNDREDS_OF_NANOS_IN_A_SECOND / 25);
+         THREAD_SLEEP(HUNDREDS_OF_NANOS_IN_A_SECOND / 25);
+     }
+@@ -744,7 +744,7 @@ TEST_F(PeerConnectionFunctionalityTest, exchangeMedia)
+     EXPECT_EQ(connectTwoPeers(offerPc, answerPc), TRUE);
+ 
+     for (auto i = 0; i <= 1000 && ATOMIC_LOAD(&seenVideo) != 1; i++) {
+-        EXPECT_EQ(writeFrame(offerVideoTransceiver, &videoFrame), STATUS_SUCCESS);
++        EXPECT_EQ(writeFrame(offerVideoTransceiver, &videoFrame, 0), STATUS_SUCCESS);
+         videoFrame.presentationTs += (HUNDREDS_OF_NANOS_IN_A_SECOND / 25);
+ 
+         THREAD_SLEEP(HUNDREDS_OF_NANOS_IN_A_MILLISECOND);
+@@ -821,7 +821,7 @@ TEST_F(PeerConnectionFunctionalityTest, exchangeMediaRSA)
+     EXPECT_EQ(connectTwoPeers(offerPc, answerPc), TRUE);
+ 
+     for (auto i = 0; i <= 1000 && ATOMIC_LOAD(&seenVideo) != 1; i++) {
+-        EXPECT_EQ(writeFrame(offerVideoTransceiver, &videoFrame), STATUS_SUCCESS);
++        EXPECT_EQ(writeFrame(offerVideoTransceiver, &videoFrame, 0), STATUS_SUCCESS);
+         videoFrame.presentationTs += (HUNDREDS_OF_NANOS_IN_A_SECOND / 25);
+ 
+         THREAD_SLEEP(HUNDREDS_OF_NANOS_IN_A_MILLISECOND);
+@@ -1009,7 +1009,7 @@ TEST_F(PeerConnectionFunctionalityTest, DISABLED_exchangeMediaThroughTurnRandomS
+ 
+             auto sendVideoWorker = [](PRtcRtpTransceiver pRtcRtpTransceiver, Frame frame, PSIZE_T pTerminationFlag) -> void {
+                 while (!ATOMIC_LOAD_BOOL(pTerminationFlag)) {
+-                    EXPECT_EQ(writeFrame(pRtcRtpTransceiver, &frame), STATUS_SUCCESS);
++                    EXPECT_EQ(writeFrame(pRtcRtpTransceiver, &frame, 0), STATUS_SUCCESS);
+                     // frame was copied by value
+                     frame.presentationTs += (HUNDREDS_OF_NANOS_IN_A_SECOND / 25);
+ 
+diff --git a/tst/RtcpFunctionalityTest.cpp b/tst/RtcpFunctionalityTest.cpp
+index 00d76ad65..08246ddfd 100644
+--- a/tst/RtcpFunctionalityTest.cpp
++++ b/tst/RtcpFunctionalityTest.cpp
+@@ -29,7 +29,7 @@ class RtcpFunctionalityTest : public WebRtcClientTestBase {
+         track.codec = RTC_CODEC_VP8;
+         PRtcRtpTransceiver out = nullptr;
+         EXPECT_EQ(STATUS_SUCCESS, ::addTransceiver(pRtcPeerConnection, &track, nullptr, &out));
+-        ((PKvsRtpTransceiver) out)->sender.ssrc = ssrc;
++        ((PKvsRtpTransceiver) out)->sender[0].ssrc = ssrc;
+         return out;
+     }
+ };
+@@ -154,12 +154,12 @@ TEST_F(RtcpFunctionalityTest, onRtcpPacketCompoundNack)
+     initTransceiver(44000);
+     ASSERT_EQ(STATUS_SUCCESS,
+               createRtpRollingBuffer(DEFAULT_ROLLING_BUFFER_DURATION_IN_SECONDS * HIGHEST_EXPECTED_BIT_RATE / 8 / DEFAULT_MTU_SIZE,
+-                                     &pKvsRtpTransceiver->sender.packetBuffer));
++                                     &pKvsRtpTransceiver->sender[0].packetBuffer));
+     ASSERT_EQ(STATUS_SUCCESS,
+-              createRetransmitter(DEFAULT_SEQ_NUM_BUFFER_SIZE, DEFAULT_VALID_INDEX_BUFFER_SIZE, &pKvsRtpTransceiver->sender.retransmitter));
++              createRetransmitter(DEFAULT_SEQ_NUM_BUFFER_SIZE, DEFAULT_VALID_INDEX_BUFFER_SIZE, &pKvsRtpTransceiver->sender[0].retransmitter));
+     ASSERT_EQ(STATUS_SUCCESS, createRtpPacketWithSeqNum(0, &pRtpPacket));
+ 
+-    ASSERT_EQ(STATUS_SUCCESS, rtpRollingBufferAddRtpPacket(pKvsRtpTransceiver->sender.packetBuffer, pRtpPacket));
++    ASSERT_EQ(STATUS_SUCCESS, rtpRollingBufferAddRtpPacket(pKvsRtpTransceiver->sender[0].packetBuffer, pRtpPacket));
+     ASSERT_EQ(STATUS_SUCCESS, onRtcpPacket(pKvsPeerConnection, validRtcpPacket, SIZEOF(validRtcpPacket)));
+     RtcOutboundRtpStreamStats stats{};
+     getRtpOutboundStats(pRtcPeerConnection, nullptr, &stats);
+-- 
+2.25.1
+

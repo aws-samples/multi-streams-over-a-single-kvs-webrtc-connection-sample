@@ -1,8 +1,11 @@
-KVS WebRTC Viewer For Multi Camera Streams
+Multi Streams Over A Single KVS WebRTC Connection Sample
 =============================================
-This is a static webpage that demonstrates how to support multi camera stream in a KVS WebRTC Viewer with a single p2p session.
+This is a static webpage that demonstrates how to support multi camera streams in a KVS WebRTC Viewer with a single p2p session.
 
 ## Getting Started
+This package works in conjunction with a specific remote side KVS WebRTC Master. To build and run the Master, please refer README.md file under csdk/.
+
+### Viewer setup
 1. Clone or download the source code of this project.
 2. Run the `index.html` locally or host all source code in your own controlled server.
 
@@ -10,7 +13,7 @@ Before you click `Start Viewer` button, you will need to input the following inf
 - Region
 - Access Key ID
 - Secret Access Key
-- Channel Name
+- Channel Name 
 
 ## License Summary
 This project is licensed under the [MIT-0 License](https://spdx.org/licenses/MIT-0.html). See [LICENSE](LICENSE) for more information.

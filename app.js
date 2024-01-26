@@ -284,10 +284,8 @@ async function printPeerConnectionStateInfo(event, logPrefix, remoteClientId) {
             if (sender.transport) {
                 const iceTransport = sender.transport.iceTransport;
                 if (iceTransport) {
-                    const logSelectedCandidate = () => {
-                        console.debug('trackType :', trackType);
-                        console.debug('Chosen candidate pair :', iceTransport.getSelectedCandidatePair());
-                    };
+                    const logSelectedCandidate = () =>
+                        console.debug(`Chosen candidate pair (${trackType || 'unknown'}):`, iceTransport.getSelectedCandidatePair());
                     iceTransport.onselectedcandidatepairchange = logSelectedCandidate;
                     logSelectedCandidate();
                 }
